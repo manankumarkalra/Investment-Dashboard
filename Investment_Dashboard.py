@@ -20,7 +20,6 @@ st.title("📈 Investment & Portfolio Dashboard")
 # ============================================================================
 
 EQUITY_HOLDINGS = [
-    # name, ticker (NSE), sector, invested_amount (Rs)
     ("Maruti Suzuki India", "MARUTI.NS", "Automobile", 900000),
     ("Tata Consultancy Services", "TCS.NS", "Information Technology", 900000),
     ("Indian Hotels Company", "INDHOTEL.NS", "Services & Logistics", 900000),
@@ -39,18 +38,17 @@ GOLD_HOLDINGS = [
 ]
 
 DEBT_HOLDINGS = [
-    # name, annual_ytm (decimal), invested_amount (Rs)
     ("AAA PSU Bond / Bharat Bond ETF", 0.078, 800000),
     ("AA/AA+ Corporate NCD", 0.098, 700000),
     ("RBI G-Sec / SDL (3-yr)", 0.073, 500000),
 ]
 
-BENCHMARK_TICKER = "^NSEI"  # Nifty 50 index
+BENCHMARK_TICKER = "^NSEI"
 
-# Sidebar Controls
+# Sidebar Control - Default set to 1 day ago to match original Colab setup
 st.sidebar.header("Dashboard Controls")
 start_date = st.sidebar.date_input(
-    "Start Date", value=date.today() - timedelta(days=365)
+    "Start / Entry Date", value=date.today() - timedelta(days=1)
 )
 
 # ============================================================================
@@ -58,21 +56,23 @@ start_date = st.sidebar.date_input(
 # ============================================================================
 
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def fetch_price_history(tickers, start_d):
-    """Download daily adjusted close price history for a list of tickers."""
     end = date.today() + timedelta(days=1)
     data = yf.download(tickers, start=start_d, end=end, progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
+
+    if "Close" in data:
         close = data["Close"]
     else:
-        close = data[["Close"]]
-        close.columns = tickers
+        close = data
+
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+
     return close.dropna(how="all")
 
 
 def get_entry_and_current_price(price_series, start_d):
-    """Entry price = first available close on/after start_date. Current = last available close."""
     series = price_series.dropna()
     if series.empty:
         return None, None
@@ -85,7 +85,6 @@ def get_entry_and_current_price(price_series, start_d):
 
 
 def accrued_debt_value(invested, annual_ytm, start_d):
-    """Simple compounding accrual: value = invested * (1 + ytm)^(days/365)."""
     days_elapsed = (date.today() - start_d).days
     days_elapsed = max(days_elapsed, 0)
     return invested * (1 + annual_ytm) ** (days_elapsed / 365)
@@ -96,7 +95,7 @@ all_market_tickers = [t for _, t, _, _ in EQUITY_HOLDINGS] + [
 ]
 all_tickers_incl_benchmark = all_market_tickers + [BENCHMARK_TICKER]
 
-with st.spinner("Fetching live and historical prices..."):
+with st.spinner("Fetching live prices..."):
     price_history = fetch_price_history(
         all_tickers_incl_benchmark, start_date
     )
@@ -205,8 +204,8 @@ m2.metric(
 m3.metric("Annualized Return", f"{annualized_return:.2f}%")
 m4.metric(
     "vs Nifty 50",
-    f"{total_pct_return - nifty_pct_return:+.2f}%",
-    delta=f"Nifty: {nifty_pct_return:+.2f}%",
+    f"{total_pct_return - (nifty_pct_return if nifty_pct_return else 0):+.2f}%",
+    delta=f"Nifty: {nifty_pct_return:+.2f}%" if nifty_pct_return else "Nifty: N/A",
 )
 
 st.markdown("---")
@@ -242,39 +241,42 @@ for name, ytm, invested in DEBT_HOLDINGS:
         debt_series, fill_value=0
     )
 
-portfolio_indexed = (
-    portfolio_daily_value / portfolio_daily_value.iloc[0]
-) * 100
-nifty_indexed = (
-    nifty_series.reindex(portfolio_daily_value.index).ffill()
-    / nifty_series.iloc[0]
-) * 100
+if not portfolio_daily_value.empty and portfolio_daily_value.iloc[0] > 0:
+    portfolio_indexed = (
+        portfolio_daily_value / portfolio_daily_value.iloc[0]
+    ) * 100
+    fig_compare = go.Figure()
+    fig_compare.add_trace(
+        go.Scatter(
+            x=portfolio_indexed.index,
+            y=portfolio_indexed,
+            name="Portfolio",
+            line=dict(color="#2E86AB", width=2.5),
+        )
+    )
 
-fig_compare = go.Figure()
-fig_compare.add_trace(
-    go.Scatter(
-        x=portfolio_indexed.index,
-        y=portfolio_indexed,
-        name="Portfolio",
-        line=dict(color="#2E86AB", width=2.5),
+    if not nifty_series.empty:
+        nifty_indexed = (
+            nifty_series.reindex(portfolio_daily_value.index).ffill()
+            / nifty_series.iloc[0]
+        ) * 100
+        fig_compare.add_trace(
+            go.Scatter(
+                x=nifty_indexed.index,
+                y=nifty_indexed,
+                name="Nifty 50",
+                line=dict(color="#A23B72", width=2, dash="dash"),
+            )
+        )
+
+    fig_compare.update_layout(
+        height=420,
+        xaxis_title="Date",
+        yaxis_title="Indexed Value (Start = 100)",
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.05),
     )
-)
-fig_compare.add_trace(
-    go.Scatter(
-        x=nifty_indexed.index,
-        y=nifty_indexed,
-        name="Nifty 50",
-        line=dict(color="#A23B72", width=2, dash="dash"),
-    )
-)
-fig_compare.update_layout(
-    height=420,
-    xaxis_title="Date",
-    yaxis_title="Indexed Value (Start = 100)",
-    hovermode="x unified",
-    legend=dict(orientation="h", y=1.05),
-)
-st.plotly_chart(fig_compare, use_container_width=True)
+    st.plotly_chart(fig_compare, use_container_width=True)
 
 # Allocation Pie Charts
 st.subheader("Portfolio Allocations")
