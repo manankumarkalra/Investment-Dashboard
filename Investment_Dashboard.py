@@ -1191,7 +1191,52 @@ invested_capital = float(df_master["Allocated_Amount"].sum())
 current_pnl = current_portfolio_value - invested_capital
 current_pnl_pct = current_pnl / invested_capital if invested_capital else 0.0
 
+# ------------------------------------------------------------
+# LIVE TARGET FEASIBILITY
+# ------------------------------------------------------------
+# The target corpus remains fixed. Market movements change the portfolio's
+# current value, so the CAGR required from TODAY to the target date changes.
+target_date = VALUATION_DATE + pd.DateOffset(years=HORIZON_YEARS)
+remaining_days = max((target_date.normalize() - TODAY).days, 0)
+remaining_years = remaining_days / 365.25
+
 portfolio_expected_return = optimization_meta["achieved_expected_return"]
+
+if remaining_years > 0 and current_portfolio_value > 0:
+    live_required_cagr = (
+        (persona_cfg["target_corpus"] / current_portfolio_value)
+        ** (1.0 / remaining_years)
+        - 1.0
+    )
+else:
+    live_required_cagr = (
+        0.0 if current_portfolio_value >= persona_cfg["target_corpus"] else np.inf
+    )
+
+live_expected_end_value = (
+    current_portfolio_value
+    * (1.0 + portfolio_expected_return) ** remaining_years
+    if remaining_years > 0
+    else current_portfolio_value
+)
+
+# This is the answer to: "How much could the portfolio actually become by
+# the target date if today's current portfolio value and today's modelled
+# return continue?"  It is distinct from the investor's fixed target.
+live_projected_gain = live_expected_end_value - current_portfolio_value
+live_projected_gain_pct = (
+    live_projected_gain / current_portfolio_value
+    if current_portfolio_value > 0 else 0.0
+)
+live_target_surplus_deficit = live_expected_end_value - persona_cfg["target_corpus"]
+
+live_target_achievable = (
+    current_portfolio_value >= persona_cfg["target_corpus"]
+    or (
+        np.isfinite(live_required_cagr)
+        and portfolio_expected_return >= live_required_cagr
+    )
+)
 portfolio_realized_cagr = float(
     (df_master["Portfolio_Weight"] * df_master["Actual_CAGR"]).sum()
 )
@@ -1218,7 +1263,8 @@ silver_return = float(
     (df_master.loc[silver_mask, "Portfolio_Weight"] * df_master.loc[silver_mask, "Total_Expected_Return"]).sum()
 )
 
-# Target path is informational only; it is not used to calculate weights.
+# Inception target path remains a fixed benchmark; live target status is
+# recalculated from today's current value and remaining time.
 yrs = np.arange(0, HORIZON_YEARS + 1)
 target_path = CORPUS * ((1 + target_cagr) ** yrs)
 expected_path = CORPUS * ((1 + portfolio_expected_return) ** yrs)
@@ -1302,29 +1348,61 @@ k2.markdown(
 )
 k3.markdown(
     kpi_card(
-        "Required CAGR",
-        f"{target_cagr:.2%}",
-        f'<div class="kpi-delta-pos">Target benchmark only</div>',
+        "CAGR Needed From Today",
+        f"{live_required_cagr:.2%}" if np.isfinite(live_required_cagr) else "N/A",
+        f'<div class="{ "kpi-delta-pos" if live_target_achievable else "kpi-delta-neg" }">'
+        f'{"On track" if live_target_achievable else "At risk"}</div>',
     ),
     unsafe_allow_html=True,
 )
 k4.markdown(
     kpi_card(
-        "Modelled Expected Return",
+        "Current Modelled Return",
         f"{portfolio_expected_return:.2%}",
-        f'<div class="kpi-delta-pos">Risk-profile weighted</div>',
+        '<div class="kpi-delta-pos">Based on current market/risk data</div>',
     ),
     unsafe_allow_html=True,
 )
 k5.markdown(
     kpi_card(
-        "Expected 3Y Value",
-        f"₹{expected_final_value/1e7:.2f} Cr",
-        f'<div class="{ "kpi-delta-pos" if expected_final_value >= persona_cfg["target_corpus"] else "kpi-delta-neg" }">'
-        f'vs target ₹{persona_cfg["target_corpus"]/1e7:.2f} Cr</div>',
+        "Projected Value at Target Date",
+        f"₹{live_expected_end_value/1e7:.2f} Cr",
+        f'<div class="{ "kpi-delta-pos" if live_target_surplus_deficit >= 0 else "kpi-delta-neg" }">'
+        f'{"₹{:,.0f} above".format(live_target_surplus_deficit) if live_target_surplus_deficit >= 0 else "₹{:,.0f} below".format(abs(live_target_surplus_deficit))} target</div>',
     ),
     unsafe_allow_html=True,
 )
+
+# Prominent "actual amount" projection card.
+proj_l, proj_r = st.columns([1.5, 1])
+with proj_l:
+    st.markdown(
+        f"""
+        <div class="hero-wrap" style="margin-top:6px;">
+            <div class="hero-eyebrow">LIVE 3-YEAR PROJECTION</div>
+            <div class="hero-big-number">₹{live_expected_end_value/1e7:.2f} Cr</div>
+            <div class="hero-big-label">
+                Estimated portfolio value on {target_date.strftime("%d %b %Y")}
+                if today's portfolio value and modelled annual return continue.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with proj_r:
+    st.markdown(
+        f"""
+        <div class="hero-wrap" style="margin-top:6px;">
+            <div class="hero-eyebrow">VALUE ADDED FROM TODAY</div>
+            <div class="hero-big-number">₹{live_projected_gain/1e5:.2f} L</div>
+            <div class="hero-big-label">
+                Implied gain of {live_projected_gain_pct:.2%} from today's
+                ₹{current_portfolio_value/1e7:.2f} Cr over the remaining horizon.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # Reconciliation check: all instruments should sum back to the ₹1 Cr invested
 # amount at inception, before dividends or market movement.
@@ -1349,6 +1427,24 @@ else:
         f"is not feasible under the current assumptions and risk guardrails. "
         f"The model therefore shows the maximum achievable outcome of "
         f"₹{expected_final_value/1e7:.2f} Cr."
+    )
+
+if live_target_achievable:
+    st.success(
+        f"Live target check: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
+        f"With {remaining_years:.2f} years remaining until {target_date.strftime('%d %b %Y')}, "
+        f"the portfolio needs {live_required_cagr:.2%} CAGR from today to reach the fixed "
+        f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr target. "
+        f"Current modelled return is {portfolio_expected_return:.2%}; the target is currently on track."
+    )
+else:
+    st.warning(
+        f"Live target check: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
+        f"With {remaining_years:.2f} years remaining until {target_date.strftime('%d %b %Y')}, "
+        f"the portfolio needs {live_required_cagr:.2%} CAGR from today to reach the fixed "
+        f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr target, "
+        f"versus a current modelled return of {portfolio_expected_return:.2%}. "
+        f"The target is currently at risk."
     )
 
 # ============================================================
@@ -1505,17 +1601,24 @@ with tab_overview:
     with c2:
         st.markdown('<div class="section-title">Target vs Expected Trajectory</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="section-note">The target line is the investor objective and is converted into the minimum CAGR required by the portfolio optimizer.</div>',
+            f'<div class="section-note">Current portfolio: ₹{current_portfolio_value/1e7:.2f} Cr · projected value at {target_date.strftime("%d %b %Y")}: ₹{live_expected_end_value/1e7:.2f} Cr · fixed target: ₹{persona_cfg["target_corpus"]/1e7:.2f} Cr.</div>',
             unsafe_allow_html=True,
         )
 
         fig_growth = go.Figure()
+        # Plot the live modelled path from the current portfolio value.
+        live_elapsed = np.linspace(0, max(remaining_years, 0.0), HORIZON_YEARS + 1)
+        live_projection_path = (
+            current_portfolio_value * (1.0 + portfolio_expected_return) ** live_elapsed
+        )
+
         fig_growth.add_trace(
             go.Scatter(
-                x=yrs,
-                y=expected_path,
+                x=[min(max((TODAY - VALUATION_DATE).days / 365.25, 0), HORIZON_YEARS) + x
+                   for x in live_elapsed],
+                y=live_projection_path,
                 mode="lines+markers",
-                name=f"Modelled Expected ({portfolio_expected_return:.2%})",
+                name=f"Live Projection ({portfolio_expected_return:.2%})",
                 line=dict(color=GOLD, width=3),
             )
         )
@@ -1528,6 +1631,16 @@ with tab_overview:
                 line=dict(color=TEXT_MUTED, dash="dash"),
             )
         )
+        fig_growth.add_trace(
+            go.Scatter(
+                x=[min(max((TODAY - VALUATION_DATE).days / 365.25, 0), HORIZON_YEARS)],
+                y=[current_portfolio_value],
+                mode="markers",
+                name="Current Portfolio Value",
+                marker=dict(size=12, color=TEAL),
+            )
+        )
+
         fig_growth.update_layout(
             height=340,
             xaxis_title="Years elapsed",
