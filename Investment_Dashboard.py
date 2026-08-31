@@ -437,28 +437,198 @@ def fetch_dividend_yield(ticker):
 
 
 
-@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
-def fetch_dividend_history_and_events(start_date, end_date):
-    """
-    Builds the dividend cash-flow history from yfinance.
+def _nse_session():
+    """Create a browser-like NSE session for official public API calls."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+    try:
+        session.get("https://www.nseindia.com/", timeout=15)
+    except Exception:
+        pass
+    return session
 
-    yfinance provides declared dividend amounts as corporate-action/ex-dividend
-    events. It does not reliably expose the issuer's board-announcement date.
-    Where NSE's public corporate-action page is accessible, the app also tries
-    to capture the NSE corporate-action record. The UI labels the date correctly
-    so ex-dates are never presented as declaration dates.
+
+def _parse_dividend_amount(purpose):
+    """Extract dividend per share from NSE's purpose text."""
+    text = str(purpose or "")
+    patterns = [
+        r"Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Interim Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Interim Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Dividend[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return float(m.group(1))
+    return np.nan
+
+
+def _normalize_nse_date(value):
+    return pd.to_datetime(value, errors="coerce", dayfirst=False)
+
+
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def fetch_nse_dividends(symbols, start_date, end_date):
+    """
+    PRIMARY dividend feed: NSE public corporate-actions + corporate-announcements APIs.
+
+    Corporate Actions provides dividend amount, ex-date and record date.
+    Corporate Announcements provides the company's exchange broadcast date.
+    This is more authoritative for an NSE-listed portfolio than relying on
+    yfinance's dividend history alone.
     """
     start_date = pd.Timestamp(start_date)
     end_date = pd.Timestamp(end_date)
+    session = _nse_session()
 
     rows = []
-    equity_items = [x for x in INSTRUMENTS_MASTER if x["Type"] == "Equity"]
 
-    for item in equity_items:
-        ticker = item["Ticker"]
-        symbol = ticker.replace(".NS", "")
+    for symbol in symbols:
+        # ---------- Official corporate actions ----------
+        actions_url = (
+            "https://www.nseindia.com/api/corporates-corporateActions"
+            f"?index=equities&symbol={symbol}"
+        )
+        actions = []
+        try:
+            r = session.get(actions_url, timeout=15)
+            r.raise_for_status()
+            payload = r.json()
+            if isinstance(payload, dict):
+                actions = payload.get("data", payload.get("corporateActions", []))
+            elif isinstance(payload, list):
+                actions = payload
+        except Exception:
+            actions = []
 
-        # Yahoo dividend history: event date is normally the ex-dividend date.
+        # ---------- Official corporate announcements ----------
+        announcements_url = (
+            "https://www.nseindia.com/api/corporate-announcements"
+            f"?index=equities&symbol={symbol}"
+        )
+        announcements = []
+        try:
+            r = session.get(announcements_url, timeout=15)
+            r.raise_for_status()
+            payload = r.json()
+            if isinstance(payload, dict):
+                announcements = payload.get("data", [])
+            elif isinstance(payload, list):
+                announcements = payload
+        except Exception:
+            announcements = []
+
+        dividend_actions = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+
+            purpose = action.get("subject", action.get("purpose", ""))
+            if "DIVIDEND" not in str(purpose).upper():
+                continue
+
+            ex_date = _normalize_nse_date(
+                action.get("exDate", action.get("ex_date"))
+            )
+            record_date = _normalize_nse_date(
+                action.get("recDate", action.get("recordDate", action.get("record_date")))
+            )
+            amount = _parse_dividend_amount(purpose)
+
+            if pd.isna(ex_date) and pd.isna(record_date):
+                continue
+
+            # Keep only events relevant to the portfolio's investment period.
+            action_date = ex_date if pd.notna(ex_date) else record_date
+            if pd.notna(action_date) and (
+                action_date < start_date or action_date > end_date
+            ):
+                continue
+
+            dividend_actions.append({
+                "Symbol": symbol,
+                "NSE Purpose": purpose,
+                "Dividend / Share": amount,
+                "Ex-Date": ex_date,
+                "Record Date": record_date,
+                "Source": "NSE Corporate Actions API",
+            })
+
+        # Match the closest dividend-related corporate announcement to each
+        # corporate action. The announcement feed's `an_dt` is an exchange
+        # broadcast timestamp.
+        for row in dividend_actions:
+            relevant_ann = []
+            for ann in announcements:
+                if not isinstance(ann, dict):
+                    continue
+                subject = str(ann.get("desc", ann.get("subject", "")))
+                if "DIVIDEND" not in subject.upper():
+                    continue
+
+                ann_date = _normalize_nse_date(
+                    ann.get("an_dt", ann.get("sort_date", ann.get("broadcastDate")))
+                )
+                if pd.notna(ann_date):
+                    if start_date - pd.Timedelta(days=30) <= ann_date <= end_date:
+                        relevant_ann.append((ann_date, subject))
+
+            if relevant_ann:
+                # Prefer the latest dividend announcement not materially after
+                # the ex-date; otherwise take the nearest announcement date.
+                ex_date = row["Ex-Date"]
+                if pd.notna(ex_date):
+                    prior = [x for x in relevant_ann if x[0] <= ex_date]
+                    chosen = max(prior, key=lambda x: x[0]) if prior else min(
+                        relevant_ann, key=lambda x: abs((x[0] - ex_date).days)
+                    )
+                else:
+                    chosen = max(relevant_ann, key=lambda x: x[0])
+                row["NSE Announcement Date"] = chosen[0]
+                row["NSE Announcement Subject"] = chosen[1]
+            else:
+                row["NSE Announcement Date"] = pd.NaT
+                row["NSE Announcement Subject"] = ""
+
+        rows.extend(dividend_actions)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
+            "NSE Announcement Date", "NSE Announcement Subject", "Source"
+        ])
+
+    df = pd.DataFrame(rows)
+
+    # De-duplicate actions by symbol + ex-date + dividend amount.
+    df = df.drop_duplicates(
+        subset=["Symbol", "Ex-Date", "Dividend / Share"],
+        keep="last",
+    )
+    return df.sort_values(["Symbol", "Ex-Date"], ascending=[True, False])
+
+
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def fetch_yahoo_dividends_fallback(symbols, start_date, end_date):
+    """Fallback only for symbols where NSE does not return an action."""
+    rows = []
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    for symbol in symbols:
+        ticker = symbol + ".NS"
         try:
             div = yf.Ticker(ticker).dividends
             div.index = pd.to_datetime(div.index)
@@ -468,176 +638,88 @@ def fetch_dividend_history_and_events(start_date, end_date):
         except Exception:
             div = pd.Series(dtype=float)
 
-        if div.empty:
-            rows.append({
-                "Company": item["Name"],
-                "Symbol": symbol,
-                "Dividend / Share": np.nan,
-                "Ex-Date": pd.NaT,
-                "NSE Announcement Date": pd.NaT,
-                "Record Date": pd.NaT,
-                "Source": "Yahoo Finance (no dividend event in period)",
-            })
-            continue
-
         for event_date, amount in div.items():
             rows.append({
-                "Company": item["Name"],
                 "Symbol": symbol,
+                "NSE Purpose": "Yahoo Finance dividend action",
                 "Dividend / Share": float(amount),
                 "Ex-Date": pd.Timestamp(event_date),
-                "NSE Announcement Date": pd.NaT,
                 "Record Date": pd.NaT,
-                "Source": "Yahoo Finance dividend action",
+                "NSE Announcement Date": pd.NaT,
+                "NSE Announcement Subject": "",
+                "Source": "Yahoo Finance fallback",
             })
 
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
+            "NSE Announcement Date", "NSE Announcement Subject", "Source"
+        ])
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
-def fetch_nse_dividend_actions(symbols):
-    """
-    Best-effort NSE cross-check.
+def build_dividend_tracker(units_by_ticker, valuation_date, today):
+    """Build one consolidated, auditable dividend ledger."""
+    symbols = [
+        item["Ticker"].replace(".NS", "")
+        for item in INSTRUMENTS_MASTER
+        if item["Type"] == "Equity"
+    ]
 
-    1) Corporate Actions page: dividend purpose + ex-date + record date.
-    2) Corporate Announcements page: latest dividend-related broadcast date
-       when the public page exposes it.
+    nse_df = fetch_nse_dividends(symbols, valuation_date, today)
 
-    The exchange data is used as a cross-check. We label the broadcast date
-    separately from the ex-date so the dashboard never confuses the two.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/126.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.nseindia.com/",
-    }
+    # Identify symbols not covered by the official feed and use Yahoo only for them.
+    covered = set(nse_df["Symbol"].dropna().astype(str)) if not nse_df.empty else set()
+    missing_symbols = [s for s in symbols if s not in covered]
+    yahoo_df = fetch_yahoo_dividends_fallback(missing_symbols, valuation_date, today)
 
-    action_rows = []
-    announcement_rows = []
-    session = requests.Session()
-
-    try:
-        session.get("https://www.nseindia.com/", headers=headers, timeout=12)
-    except Exception:
-        pass
-
-    for symbol in symbols:
-        # ---------------- Corporate Actions ----------------
-        action_url = (
-            "https://www.nseindia.com/companies-listing/"
-            f"corporate-filings-actions?symbol={symbol}&tabIndex=equity"
-        )
-        try:
-            r = session.get(action_url, headers=headers, timeout=12)
-            r.raise_for_status()
-            tables = pd.read_html(r.text)
-
-            for table in tables:
-                cols = [str(c).upper() for c in table.columns]
-                if not (
-                    any("PURPOSE" in c for c in cols)
-                    and any("EX-DATE" in c for c in cols)
-                ):
-                    continue
-
-                table.columns = [str(c).strip() for c in table.columns]
-                for _, row in table.iterrows():
-                    purpose = str(row.get("PURPOSE", ""))
-                    if "DIVIDEND" not in purpose.upper():
-                        continue
-
-                    action_rows.append({
-                        "Symbol": symbol,
-                        "NSE Purpose": purpose,
-                        "NSE Ex-Date": pd.to_datetime(
-                            row.get("EX-DATE"), errors="coerce"
-                        ),
-                        "NSE Record Date": pd.to_datetime(
-                            row.get("RECORD DATE"), errors="coerce"
-                        ),
-                    })
-                break
-        except Exception:
-            pass
-
-        # ---------------- Corporate Announcements ----------------
-        announcement_url = (
-            "https://www.nseindia.com/companies-listing/"
-            f"corporate-filings-announcements?symbol={symbol}"
-        )
-        try:
-            r = session.get(announcement_url, headers=headers, timeout=12)
-            r.raise_for_status()
-            tables = pd.read_html(r.text)
-
-            for table in tables:
-                table.columns = [str(c).strip() for c in table.columns]
-                upper_cols = [c.upper() for c in table.columns]
-
-                subject_col = next(
-                    (c for c in table.columns if "SUBJECT" in c.upper()), None
-                )
-                date_col = next(
-                    (
-                        c for c in table.columns
-                        if ("BROADCAST" in c.upper() or "ANNOUNCEMENT" in c.upper())
-                    ),
-                    None,
-                )
-                if subject_col is None or date_col is None:
-                    continue
-
-                for _, row in table.iterrows():
-                    subject = str(row.get(subject_col, ""))
-                    if "DIVIDEND" not in subject.upper():
-                        continue
-
-                    announcement_rows.append({
-                        "Symbol": symbol,
-                        "NSE Announcement Date": pd.to_datetime(
-                            row.get(date_col), errors="coerce"
-                        ),
-                        "NSE Announcement Subject": subject,
-                    })
-                break
-        except Exception:
-            pass
-
-    actions = pd.DataFrame(action_rows)
-    announcements = pd.DataFrame(announcement_rows)
-
-    if actions.empty and announcements.empty:
-        return pd.DataFrame(
-            columns=[
-                "Symbol", "NSE Purpose", "NSE Ex-Date", "NSE Record Date",
-                "NSE Announcement Date", "NSE Announcement Subject"
-            ]
-        )
-
-    if actions.empty:
-        result = announcements.copy()
-    elif announcements.empty:
-        result = actions.copy()
+    if nse_df.empty:
+        tracker = yahoo_df.copy()
+    elif yahoo_df.empty:
+        tracker = nse_df.copy()
     else:
-        # Keep the latest announcement per symbol; NSE's public page typically
-        # returns only the most recent batch for this view.
-        latest_announcement = (
-            announcements.sort_values("NSE Announcement Date")
-            .groupby("Symbol", as_index=False)
-            .tail(1)
-        )
-        result = actions.merge(
-            latest_announcement,
-            on="Symbol",
-            how="left",
-        )
+        tracker = pd.concat([nse_df, yahoo_df], ignore_index=True)
 
-    return result
+    required = [
+        "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
+        "NSE Announcement Date", "NSE Announcement Subject", "Source"
+    ]
+    for col in required:
+        if col not in tracker.columns:
+            tracker[col] = "" if "Date" not in col and col not in {"Dividend / Share"} else pd.NaT
 
+    tracker["Ticker"] = tracker["Symbol"].map(
+        {item["Ticker"].replace(".NS", ""): item["Ticker"] for item in INSTRUMENTS_MASTER}
+    )
+    tracker["Company"] = tracker["Ticker"].map(
+        {item["Ticker"]: item["Name"] for item in INSTRUMENTS_MASTER}
+    )
+    tracker["Units"] = tracker["Ticker"].map(units_by_ticker)
+    tracker["Dividend Entitlement"] = (
+        pd.to_numeric(tracker["Dividend / Share"], errors="coerce")
+        * pd.to_numeric(tracker["Units"], errors="coerce")
+    )
+
+    # Dividend is economically attributable to the portfolio once the ex-date
+    # has passed and the holder was entitled. Actual bank/DP cash receipt is
+    # not fabricated because NSE public corporate-actions data doesn't expose
+    # a universal payment confirmation field.
+    tracker["Status"] = np.where(
+        pd.to_datetime(tracker["Ex-Date"], errors="coerce").notna()
+        & (pd.to_datetime(tracker["Ex-Date"], errors="coerce") <= today),
+        "Entitled / return accrued",
+        "Declared / upcoming",
+    )
+
+    tracker["NSE Verified"] = np.where(
+        tracker["Source"].astype(str).str.startswith("NSE"),
+        "Yes",
+        "Fallback",
+    )
+
+    return tracker.sort_values(
+        ["Ex-Date", "Company"], ascending=[False, True], na_position="last"
+    ).reset_index(drop=True)
 
 
 
@@ -998,12 +1080,13 @@ with st.sidebar:
         st.rerun()
 
     refresh_note = (
-        "Daily auto-refresh enabled."
+        "Daily auto-refresh enabled; NSE corporate actions are checked each day."
         if AUTO_REFRESH_AVAILABLE
         else "Daily auto-refresh unavailable in this environment; use the refresh button. "
              "Market-data cache still expires daily."
     )
     st.caption("Investment date: 31 Aug 2026 · " + refresh_note)
+    st.caption("Dividend source priority: NSE Corporate Actions → Yahoo fallback.")
     st.caption("Persona targets determine the required CAGR constraint; the optimizer then minimizes risk within persona-specific allocation guardrails.")
 
 # ============================================================
@@ -1078,102 +1161,34 @@ df_master["DailyPriceChangePct"] = np.where(
     0.0,
 )
 
-# Dividend tracker — cash dividends received since the 31 Aug 2026 investment date.
-div_hist = fetch_dividend_history_and_events(
+# Dividend tracker — official NSE API first, Yahoo fallback only for uncovered symbols.
+units_by_ticker = df_master.set_index("Ticker")["Units"].to_dict()
+div_hist = build_dividend_tracker(
+    units_by_ticker,
     pd.Timestamp("2026-08-31"),
     TODAY,
 )
 
-if not div_hist.empty:
-    units_map = df_master.set_index("Ticker")["Units"].to_dict()
-    symbol_to_ticker = {
-        item["Ticker"].replace(".NS", ""): item["Ticker"]
-        for item in INSTRUMENTS_MASTER
-        if item["Type"] == "Equity"
-    }
-    div_hist["Ticker"] = div_hist["Symbol"].map(symbol_to_ticker)
-    div_hist["Units"] = div_hist["Ticker"].map(units_map)
-    div_hist["Cash Dividend"] = div_hist["Dividend / Share"] * div_hist["Units"]
-else:
-    div_hist = pd.DataFrame(
-        columns=[
-            "Company", "Symbol", "Dividend / Share", "Ex-Date",
-            "NSE Announcement Date", "Record Date",
-            "NSE Announcement Subject", "Source",
-            "Ticker", "Units", "Cash Dividend"
-        ]
-    )
-
-# Guarantee the dividend-event schema even when a data provider returns
-# zero events or only a partial response. This prevents pandas KeyError.
-_dividend_required_schema = [
-    "Company", "Symbol", "Dividend / Share", "Ex-Date",
-    "NSE Announcement Date", "Record Date", "NSE Announcement Subject",
-    "Source", "Ticker", "Units", "Cash Dividend"
-]
-for _col in _dividend_required_schema:
-    if _col not in div_hist.columns:
-        if "Date" in _col or _col in {"Ex-Date", "Record Date"}:
-            div_hist[_col] = pd.NaT
-        elif _col in {"Dividend / Share", "Units", "Cash Dividend"}:
-            div_hist[_col] = np.nan
-        else:
-            div_hist[_col] = ""
-
-# NSE cross-check for declaration/broadcast information.
-try:
-    portfolio_symbols = [
-        item["Ticker"].replace(".NS", "")
-        for item in INSTRUMENTS_MASTER
-        if item["Type"] == "Equity"
-    ]
-    nse_div = fetch_nse_dividend_actions(portfolio_symbols)
-except Exception:
-    nse_div = pd.DataFrame()
-
-if not nse_div.empty:
-    # Merge the nearest NSE ex-date information to the Yahoo event.
-    div_hist["NSE Announcement Date"] = pd.NaT
-    div_hist["NSE Record Date"] = pd.NaT
-    div_hist["NSE Announcement Subject"] = ""
-
-    for i, drow in div_hist.iterrows():
-        symbol = drow.get("Symbol")
-        ex_date = drow.get("Ex-Date")
-        candidates = nse_div[nse_div["Symbol"] == symbol].copy()
-
-        if not candidates.empty and pd.notna(ex_date):
-            if "NSE Ex-Date" in candidates:
-                candidates["date_diff"] = (
-                    pd.to_datetime(candidates["NSE Ex-Date"], errors="coerce")
-                    - pd.Timestamp(ex_date)
-                ).abs().dt.dayss
-                candidates = candidates.sort_values("date_diff")
-
-            best = candidates.iloc[0]
-            div_hist.at[i, "NSE Announcement Date"] = best.get(
-                "NSE Announcement Date", pd.NaT
-            )
-            div_hist.at[i, "NSE Record Date"] = best.get(
-                "NSE Record Date", pd.NaT
-            )
-            div_hist.at[i, "NSE Announcement Subject"] = best.get(
-                "NSE Announcement Subject", ""
-            )
-
-dividend_cash_received = float(
+dividend_entitlement = float(
     pd.to_numeric(
-        div_hist.get("Cash Dividend", pd.Series(dtype=float)),
+        div_hist.get("Dividend Entitlement", pd.Series(dtype=float)),
         errors="coerce"
     ).fillna(0).sum()
 )
 
-df_master["DividendCashReceived"] = 0.0
+df_master["DividendEntitlement"] = 0.0
 if not div_hist.empty:
-    cash_by_ticker = div_hist.groupby("Ticker")["Cash Dividend"].sum()
-    df_master["DividendCashReceived"] = df_master["Ticker"].map(cash_by_ticker).fillna(0.0)
+    dividend_by_ticker = div_hist.groupby("Ticker")["Dividend Entitlement"].sum()
+    df_master["DividendEntitlement"] = (
+        df_master["Ticker"].map(dividend_by_ticker).fillna(0.0)
+    )
 
-df_master["TotalCurrentValue"] = df_master["CurrentValue"] + df_master["DividendCashReceived"]
+# For total-return accounting, entitled dividends are included because the
+# investor has earned the economic dividend after the ex-date. We separately
+# label them as "entitlement" rather than falsely claiming a payment receipt.
+df_master["TotalCurrentValue"] = (
+    df_master["CurrentValue"] + df_master["DividendEntitlement"]
+)
 df_master["TotalInvestmentGain"] = (
     df_master["TotalCurrentValue"] - df_master["Allocated_Amount"]
 )
@@ -1506,7 +1521,7 @@ with detail_left:
         "Price Date": str(pd.Timestamp(selected_row["PriceDate"]).date()) if pd.notna(selected_row["PriceDate"]) else "N/A",
         "Units": f"{selected_row['Units']:,.4f}" if pd.notna(selected_row["Units"]) else "N/A",
         "Daily Price Change": f"{selected_row['DailyPriceChangePct']:+.2%}",
-        "Dividend Cash Received": f"₹{selected_row['DividendCashReceived']:,.0f}",
+        "Dividend Earned / Entitled": f"₹{selected_row['DividendEntitlement']:,.0f}",
         "Beta": f"{selected_row['Beta']:.2f}",
         "Volatility": f"{selected_row['Volatility']:.2%}",
         "Historical CAGR": f"{selected_row['Actual_CAGR']:.2%}",
@@ -1695,7 +1710,10 @@ with tab_overview:
         },
     )
 
-    st.markdown('<div class="section-title">Dividend Tracker</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-title">Dividend Tracker · ₹{dividend_entitlement:,.0f} earned/entitled</div>',
+        unsafe_allow_html=True
+    )
     st.markdown(
         '<div class="section-note">Dividend events affecting the portfolio since the 31 Aug 2026 investment date. Ex-date is the corporate-action date used for dividend entitlement. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
         unsafe_allow_html=True,
@@ -1703,7 +1721,7 @@ with tab_overview:
     required_display_cols = [
         "Company", "Dividend / Share", "NSE Announcement Date",
         "NSE Announcement Subject", "Ex-Date", "Record Date",
-        "Cash Dividend", "Source"
+        "Dividend Entitlement", "Status", "NSE Verified", "Source"
     ]
     dividend_view = div_hist.reindex(columns=required_display_cols).copy()
 
@@ -1726,13 +1744,21 @@ with tab_overview:
                 ),
                 "Ex-Date": st.column_config.DateColumn(format="DD MMM YYYY"),
                 "Record Date": st.column_config.DateColumn(format="DD MMM YYYY"),
-                "Cash Dividend": st.column_config.NumberColumn(format="₹%d"),
+                "Dividend Entitlement": st.column_config.NumberColumn(
+                    "Dividend Earned / Entitlement", format="₹%d"
+                ),
             },
+        )
+
+        st.caption(
+            f"Dividend entitlement included in portfolio total return: "
+            f"₹{dividend_entitlement:,.0f}. NSE is the primary corporate-action source; "
+            f"Yahoo Finance is used only when NSE returns no event for a selected stock."
         )
     else:
         st.info(
             "No dividend event has been recorded since the 31 Aug 2026 investment date. "
-            "The tracker will check again on the next daily refresh."
+            "The official NSE corporate-action feed will be checked again on the next refresh."
         )
 
 # ---------- TAB 2: HOLDINGS ----------
@@ -1747,7 +1773,7 @@ with tab_holdings:
     display_df["Current Price"] = display_df["CurrentPrice"]
     display_df["Price Date"] = display_df["PriceDate"]
     display_df["Daily Change %"] = display_df["DailyPriceChangePct"]
-    display_df["Dividend Cash"] = display_df["DividendCashReceived"]
+    display_df["Dividend Earned"] = display_df["DividendEntitlement"]
     display_df["Total Gain"] = display_df["TotalInvestmentGain"]
     display_df["Historical CAGR"] = display_df["Actual_CAGR"]
     display_df["Dividend / Interest"] = display_df["ExpectedIncomeYield"]
@@ -1762,7 +1788,7 @@ with tab_holdings:
     cols = [
         "Name", "Type", "Sector", "CapCategory", "Current Price", "Price Date",
         "Units", "Portfolio Weight %", "Allocated_Amount", "CurrentValue",
-        "Dividend Cash", "Total Gain", "Daily Change %", "Historical CAGR",
+        "Dividend Earned", "Total Gain", "Daily Change %", "Historical CAGR",
         "Capital Gain", "Dividend / Interest", "Expected Total Return", "Beta",
     ]
 
@@ -1799,7 +1825,7 @@ with tab_holdings:
             "Allocated_Amount": st.column_config.NumberColumn("Invested", format="₹%d"),
             "CurrentValue": st.column_config.NumberColumn("Current Value", format="₹%d"),
             "UnrealizedPnL": st.column_config.NumberColumn("Price P&L", format="₹%d"),
-            "Dividend Cash": st.column_config.NumberColumn(format="₹%d"),
+            "Dividend Earned": st.column_config.NumberColumn(format="₹%d"),
             "Total Gain": st.column_config.NumberColumn(format="₹%d"),
             "Daily Change %": st.column_config.NumberColumn(format="%.2f%%"),
             "Historical CAGR": st.column_config.NumberColumn(format="%.2f%%"),
@@ -2046,5 +2072,5 @@ with tab_history:
 st.write("")
 st.caption(
     f"Educational/simulation dashboard. Holdings are fixed from 31 Aug 2026 entry prices; current value is marked to the latest available trading price. On the investment date itself, day-one P&L is zero by construction. "
-    f"Historical CAGR, beta and CAPM metrics are model estimates and should not be treated as guaranteed future returns."
+    f"Historical CAGR, beta and CAPM metrics are model estimates. Dividends are tracked from NSE corporate actions where available, with Yahoo Finance as a fallback; payment settlement is not fabricated when the source does not expose it."
 )
