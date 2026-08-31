@@ -1,666 +1,228 @@
-
-import warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import streamlit as st
-
+import warnings
 warnings.filterwarnings("ignore")
+
 pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 
-# ============================================================
-# STREAMLIT CONFIG
-# MUST BE THE FIRST STREAMLIT COMMAND
-# ============================================================
-st.set_page_config(
-    page_title="Investment Portfolio Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ============================================================
-# GLOBAL ASSUMPTIONS
-# ============================================================
-CORPUS = 1_00_00_000          # ₹1 crore
-HORIZON_YEARS = 3
-RISK_FREE_RATE = 0.069        # 6.9% modelling assumption
-MARKET_RETURN = 0.13          # 13.0% modelling assumption
-LOOKBACK_YEARS = 5
+# --- Global assumptions ---
+CORPUS          = 1_00_00_000      # ₹1 Cr starting corpus
+HORIZON_YEARS   = 3
+RISK_FREE_RATE  = 0.069            # Rf: current 10Y India G-Sec yield (~6.9%). Update from RBI/CCIL if needed.
+MARKET_RETURN   = 0.13             # Rm: long-run expected Nifty 500 total return (price CAGR + dividend yield)
+LOOKBACK_YEARS  = 5                # history window used to estimate beta / volatility / realised CAGR
 
 PERSONAS = {
-    "Aggressive": {"target_corpus": 2_25_00_000},
-    "Moderate": {"target_corpus": 2_00_00_000},
+    "Aggressive":   {"target_corpus": 2_25_00_000},
+    "Moderate":     {"target_corpus": 2_00_00_000},
     "Conservative": {"target_corpus": 1_75_00_000},
 }
-
 for name, p in PERSONAS.items():
     p["target_cagr"] = (p["target_corpus"] / CORPUS) ** (1 / HORIZON_YEARS) - 1
 
-# ============================================================
-# FIXED 15-INSTRUMENT UNIVERSE
-# 11 EQUITIES + 2 BONDS + 1 GOLD + 1 SILVER
-# ============================================================
+# --- Asset Universe ---
 universe = pd.DataFrame([
-    # ---- Equity (11) ----
-    dict(Ticker="INDIANB.NS",    Name="Indian Bank",                   AssetClass="Equity", Sector="Banking",                MarketCapCr=117286.89, PE=9.45,  EPS=92.47),
-    dict(Ticker="HAL.NS",        Name="Hindustan Aeronautics",         AssetClass="Equity", Sector="Defence / Aerospace",     MarketCapCr=327699.75, PE=34.70, EPS=138.75),
-    dict(Ticker="CHENNPETRO.NS", Name="Chennai Petroleum Corporation", AssetClass="Equity", Sector="Oil & Gas",               MarketCapCr=21027.03,  PE=4.92,  EPS=277.69),
-    dict(Ticker="MAZDOCK.NS",    Name="Mazagon Dock Shipbuilders",     AssetClass="Equity", Sector="Defence / Shipbuilding",  MarketCapCr=102377.84, PE=39.88, EPS=62.63),
-    dict(Ticker="BSE.NS",        Name="BSE Ltd.",                      AssetClass="Equity", Sector="Financial Services",      MarketCapCr=134925.97, PE=50.17, EPS=65.48),
-    dict(Ticker="NATIONALUM.NS", Name="National Aluminium Company",    AssetClass="Equity", Sector="Metals",                  MarketCapCr=73970.35,  PE=10.28, EPS=36.78),
-    dict(Ticker="FORCEMOT.NS",   Name="Force Motors",                 AssetClass="Equity", Sector="Automobiles",             MarketCapCr=23207.35,  PE=21.25, EPS=824.82),
-    dict(Ticker="LLOYDSME.NS",   Name="Lloyds Metals & Energy",       AssetClass="Equity", Sector="Metals",                  MarketCapCr=103102.04, PE=24.63, EPS=72.60),
-    dict(Ticker="APARINDS.NS",   Name="Apar Industries",              AssetClass="Equity", Sector="Electrical / Industrial", MarketCapCr=69947.11,  PE=61.89, EPS=284.94),
-    dict(Ticker="OIL.NS",        Name="Oil India",                    AssetClass="Equity", Sector="Oil & Gas",               MarketCapCr=77150.01,  PE=12.12, EPS=40.03),
-    dict(Ticker="TVSMOTOR.NS",   Name="TVS Motor Company",            AssetClass="Equity", Sector="Automobiles",             MarketCapCr=207420.66, PE=50.75, EPS=85.17),
-
-    # ---- Fixed Income (2) ----
-    dict(Ticker=None,            Name="6.03% GOI G-Sec 2029",          AssetClass="Bond", Sector="Sovereign", MarketCapCr=np.nan, PE=np.nan, EPS=np.nan),
-    dict(Ticker="EBBETF0431.NS", Name="BHARAT Bond ETF - April 2031", AssetClass="Bond", Sector="AAA PSU/CPSE", MarketCapCr=np.nan, PE=np.nan, EPS=np.nan),
-
-    # ---- Precious Metals (2) ----
-    dict(Ticker="GOLDBEES.NS",   Name="Nippon India ETF Gold BeES",   AssetClass="Gold",   Sector="Gold",   MarketCapCr=np.nan, PE=np.nan, EPS=np.nan),
-    dict(Ticker="SILVERBEES.NS", Name="Nippon India Silver ETF",      AssetClass="Silver", Sector="Silver", MarketCapCr=np.nan, PE=np.nan, EPS=np.nan),
+    dict(Ticker="INDIANB.NS",    Name="Indian Bank",                     AssetClass="Equity", Sector="Banking",                    MarketCapCr=117286.89, PE=9.45,  EPS=92.47),
+    dict(Ticker="HAL.NS",        Name="Hindustan Aeronautics",           AssetClass="Equity", Sector="Defence / Aerospace",         MarketCapCr=327699.75, PE=34.70, EPS=138.75),
+    dict(Ticker="CHENNPETRO.NS", Name="Chennai Petroleum Corporation",   AssetClass="Equity", Sector="Oil & Gas",                   MarketCapCr=21027.03,  PE=4.92,  EPS=277.69),
+    dict(Ticker="MAZDOCK.NS",    Name="Mazagon Dock Shipbuilders",       AssetClass="Equity", Sector="Defence / Shipbuilding",      MarketCapCr=102377.84, PE=39.88, EPS=62.63),
+    dict(Ticker="BSE.NS",        Name="BSE Ltd.",                        AssetClass="Equity", Sector="Financial Services",          MarketCapCr=134925.97, PE=50.17, EPS=65.48),
+    dict(Ticker="NATIONALUM.NS", Name="National Aluminium Company",      AssetClass="Equity", Sector="Metals",                      MarketCapCr=73970.35,  PE=10.28, EPS=36.78),
+    dict(Ticker="FORCEMOT.NS",   Name="Force Motors",                    AssetClass="Equity", Sector="Automobiles",                 MarketCapCr=23207.35,  PE=21.25, EPS=824.82),
+    dict(Ticker="LLOYDSME.NS",   Name="Lloyds Metals & Energy",          AssetClass="Equity", Sector="Metals",                      MarketCapCr=103102.04, PE=24.63, EPS=72.60),
+    dict(Ticker="APARINDS.NS",   Name="Apar Industries",                 AssetCapCr=69947.11,  PE=61.89, EPS=284.94),
+    dict(Ticker="OIL.NS",        Name="Oil India",                       AssetClass="Equity", Sector="Oil & Gas",                   MarketCapCr=77150.01,  PE=12.12, EPS=40.03),
+    dict(Ticker="TVSMOTOR.NS",   Name="TVS Motor Company",               AssetClass="Equity", Sector="Automobiles",                 MarketCapCr=207420.66, PE=50.75, EPS=85.17),
+    dict(Ticker=None,            Name="6.03% GOI G-Sec 2029",            AssetClass="Bond",   Sector="Sovereign",                   MarketCapCr=None, PE=None, EPS=None),
+    dict(Ticker="EBBETF0431.NS", Name="BHARAT Bond ETF - April 2031",    AssetClass="Bond",   Sector="AAA PSU/CPSE",                MarketCapCr=None, PE=None, EPS=None),
+    dict(Ticker="GOLDBEES.NS",   Name="Nippon India ETF Gold BeES",      AssetClass="Gold",   Sector="Gold",                        MarketCapCr=None, PE=None, EPS=None),
+    dict(Ticker="SILVERBEES.NS", Name="Nippon India Silver ETF",         AssetClass="Silver", Sector="Silver",                      MarketCapCr=None, PE=None, EPS=None),
 ]).set_index("Ticker", drop=False)
 
-NIFTY500_TICKERS = ["^CRSLDX", "^NSEI"]
+# --- Data Fetching & CAPM Calculations ---
+NIFTY500_TICKER = "^CRSLDX" # This is just a proxy, actual NIFTY500 index may vary, if unavailable, ^NSEI will be used
 
-# ============================================================
-# DATA HELPERS
-# ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+equity_tickers = universe[universe.AssetClass == "Equity"]["Ticker"].tolist()
+
+@st.cache_data
 def fetch_history(tickers, years=LOOKBACK_YEARS):
-    tickers = [t for t in tickers if t]
-    if not tickers:
-        return pd.DataFrame()
-
-    raw = yf.download(
-        tickers,
-        period=f"{years}y",
-        interval="1wk",
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
-
-    if raw.empty:
-        return pd.DataFrame()
-
-    # yfinance gives different shapes for one vs many tickers.
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" in raw.columns.get_level_values(0):
-            data = raw["Close"]
-        elif "Close" in raw.columns.get_level_values(1):
-            data = raw.xs("Close", axis=1, level=1)
-        else:
-            return pd.DataFrame()
-    else:
-        if "Close" not in raw.columns:
-            return pd.DataFrame()
-        data = raw[["Close"]].copy()
-        data.columns = [tickers[0]]
-
+    data = yf.download(tickers, period=f"{years}y", interval="1wk", auto_adjust=True, progress=False)["Close"]
     return data.dropna(how="all")
 
+px_hist = fetch_history(equity_tickers)
+try:
+    idx_hist = fetch_history([NIFTY500_TICKER]).iloc[:, 0]
+except Exception:
+    idx_hist = fetch_history(["^NSEI"]).iloc[:, 0]
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_current_and_dividend(ticker, fallback_price):
-    if not ticker:
-        return fallback_price, 0.0
+stock_ret = px_hist.pct_change().dropna()
+idx_ret   = idx_hist.pct_change().dropna()
+
+rows = []
+for t in equity_tickers:
+    common = stock_ret[t].align(idx_ret, join="inner")
+    s, m = common[0].dropna(), common[1].dropna()
+    s, m = s.align(m, join="inner")
+    beta = np.cov(s, m)[0, 1] / np.var(m) if np.var(m) != 0 else np.nan
+    ann_vol = s.std() * np.sqrt(52)
+    ke = RISK_FREE_RATE + beta * (MARKET_RETURN - RISK_FREE_RATE)
+
+    hist_px = px_hist[t].dropna()
+    yrs = (hist_px.index[-1] - hist_px.index[0]).days / 365.25
+    realised_cagr = (hist_px.iloc[-1] / hist_px.iloc[0]) ** (1 / yrs) - 1 if yrs > 0 else np.nan
 
     try:
-        info = yf.Ticker(ticker).info
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice") or fallback_price
-
-        # Yahoo Finance normally returns dividendYield as a decimal
-        # (e.g. 0.025 for 2.5%), not 2.5.
-        dividend_yield = info.get("dividendYield")
-        if dividend_yield is None:
-            dividend_yield = 0.0
-
-        dividend_yield = float(dividend_yield)
-        if dividend_yield > 1.0:
-            dividend_yield /= 100.0
-
-        return float(current_price), dividend_yield
+        info = yf.Ticker(t).info
+        div_yield = info.get("dividendYield", 0) or 0
+        last_price = info.get("currentPrice") or hist_px.iloc[-1]
     except Exception:
-        return float(fallback_price), 0.0
+        div_yield, last_price = 0, hist_px.iloc[-1]
 
+    rows.append(dict(Ticker=t, LivePrice=last_price, Beta=beta, AnnVolatility=ann_vol,
+                      CAPM_Return=ke, Realised5Y_CAGR=realised_cagr, DividendYield=div_yield))
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def build_market_data(equity_tickers):
-    px_hist = fetch_history(equity_tickers)
-    if px_hist.empty:
-        raise RuntimeError("Yahoo Finance returned no equity price history.")
+capm_df = pd.DataFrame(rows).set_index("Ticker")
+capm_df["RiskBucket"] = pd.cut(capm_df.Beta, bins=[-np.inf, 0.8, 1.2, np.inf],
+                                labels=["Low (Defensive)", "Medium (Core)", "High (Aggressive)"])
+capm_df = capm_df.join(universe[["Name", "Sector", "PE", "EPS"]])
 
-    # Benchmark: try NIFTY 500 first, then NIFTY 50.
-    idx_hist = pd.Series(dtype=float)
-    benchmark_used = None
+MIN_W, MAX_W = 0.04, 0.14   # per-stock floor/cap inside the equity sleeve
 
-    for benchmark in NIFTY500_TICKERS:
-        tmp = fetch_history([benchmark])
-        if not tmp.empty:
-            idx_hist = tmp.iloc[:, 0].dropna()
-            if not idx_hist.empty:
-                benchmark_used = benchmark
-                break
+inv_beta = 1 / capm_df["Beta"].clip(lower=0.2)   # floor beta at 0.2 to avoid explosive weights
+raw_w = inv_beta / inv_beta.sum()
+raw_w = raw_w.clip(lower=MIN_W, upper=MAX_W)
+capm_df["EquitySleeveWeight"] = raw_w / raw_w.sum()   # renormalise to 100% of the equity sleeve
 
-    if idx_hist.empty:
-        raise RuntimeError("Could not download a benchmark index from Yahoo Finance.")
+equity_expected_return = (capm_df["EquitySleeveWeight"] * capm_df["CAPM_Return"]).sum()
+equity_expected_divyld = (capm_df["EquitySleeveWeight"] * capm_df["DividendYield"] / 100).sum() # Corrected: Divide DividendYield by 100
 
-    stock_ret = px_hist.pct_change().dropna(how="all")
-    idx_ret = idx_hist.pct_change().dropna()
+# --- Gold/Silver/Bond Returns ---
+GOLD_SILVER_ANCHOR = 0.08
 
-    rows = []
-    for ticker in equity_tickers:
-        if ticker not in stock_ret.columns:
-            continue
+gold_ticker = universe[universe.AssetClass == "Gold"].index[0]
+silver_ticker = universe[universe.AssetClass == "Silver"].index[0]
 
-        joined = pd.concat([stock_ret[ticker], idx_ret], axis=1, join="inner").dropna()
-        if len(joined) < 30:
-            continue
+gold_silver_px_hist = fetch_history([gold_ticker, silver_ticker])
+gold_px_hist = gold_silver_px_hist[gold_ticker].dropna()
+silver_px_hist = gold_silver_px_hist[silver_ticker].dropna()
 
-        s = joined.iloc[:, 0]
-        m = joined.iloc[:, 1]
+gold_yrs = (gold_px_hist.index[-1] - gold_px_hist.index[0]).days / 365.25
+gold_return = (gold_px_hist.iloc[-1] / gold_px_hist.iloc[0]) ** (1 / gold_yrs) - 1 if gold_yrs > 0 else np.nan
 
-        market_var = np.var(m)
-        beta = np.cov(s, m)[0, 1] / market_var if market_var > 0 else np.nan
-        ann_vol = s.std() * np.sqrt(52)
-        capm_return = RISK_FREE_RATE + beta * (MARKET_RETURN - RISK_FREE_RATE)
+silver_yrs = (silver_px_hist.index[-1] - silver_px_hist.index[0]).days / 365.25
+silver_return = (silver_px_hist.iloc[-1] / silver_px_hist.iloc[0]) ** (1 / silver_yrs) - 1 if silver_yrs > 0 else np.nan
 
-        hist_px = px_hist[ticker].dropna()
-        if len(hist_px) >= 2:
-            years = (hist_px.index[-1] - hist_px.index[0]).days / 365.25
-            realised_cagr = (
-                (hist_px.iloc[-1] / hist_px.iloc[0]) ** (1 / years) - 1
-                if years > 0 and hist_px.iloc[0] > 0
-                else np.nan
-            )
-            fallback_price = float(hist_px.iloc[-1])
-        else:
-            realised_cagr = np.nan
-            fallback_price = np.nan
+gold_silver_return = (gold_return + silver_return) / 2
 
-        live_price, dividend_yield = get_current_and_dividend(ticker, fallback_price)
+bond_blended_return = 0.07 # Placeholder, actual calculation from bond instruments/ETFs is pending
 
-        rows.append({
-            "Ticker": ticker,
-            "LivePrice": live_price,
-            "Beta": beta,
-            "AnnVolatility": ann_vol,
-            "CAPM_Return": capm_return,
-            "Realised5Y_CAGR": realised_cagr,
-            "DividendYield": dividend_yield,
-        })
+# --- Allocation Results ---
+persona_bond_floor = {"Aggressive": 0.05, "Moderate": 0.15, "Conservative": 0.30}
+persona_bond_cap    = {"Aggressive": 0.15, "Moderate": 0.35, "Conservative": 0.55}
 
-    capm_df = pd.DataFrame(rows)
-    if capm_df.empty:
-        raise RuntimeError("No equity-level market data could be calculated.")
+alloc_results = {}
+for name, p in PERSONAS.items():
+    target = p["target_cagr"]
+    investable = 1 - GOLD_SILVER_ANCHOR   # split between equity & bond
+    num = target - GOLD_SILVER_ANCHOR * gold_silver_return - investable * bond_blended_return
+    den = (equity_expected_return - bond_blended_return)
+    equity_w = num / den
+    equity_w = np.clip(equity_w, investable - persona_bond_cap[name], investable - persona_bond_floor[name])
+    bond_w = investable - equity_w
 
-    capm_df = capm_df.set_index("Ticker")
-    capm_df["RiskBucket"] = pd.cut(
-        capm_df["Beta"],
-        bins=[-np.inf, 0.8, 1.2, np.inf],
-        labels=["Low (Defensive)", "Medium (Core)", "High (Aggressive)"]
-    )
+    achieved = equity_w * equity_expected_return + bond_w * bond_blended_return + GOLD_SILVER_ANCHOR * gold_silver_return
+    feasible = abs(achieved - target) < 0.005
 
-    capm_df = capm_df.join(universe[["Name", "Sector", "PE", "EPS"]])
-    return capm_df, benchmark_used
+    alloc_results[name] = dict(EquityWeight=equity_w, BondWeight=bond_w,
+                                GoldSilverWeight=GOLD_SILVER_ANCHOR,
+                                TargetCAGR=target, AchievedCAGR=achieved, Feasible=feasible)
 
+alloc_df = pd.DataFrame(alloc_results).T
+alloc_df[["EquityWeight","BondWeight","GoldSilverWeight","TargetCAGR","AchievedCAGR"]] = \
+    alloc_df[["EquityWeight","BondWeight","GoldSilverWeight","TargetCAGR","AchievedCAGR"]].astype(float).round(4)
 
-# ============================================================
-# PORTFOLIO CALCULATION
-# ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def calculate_portfolio():
-    equity_tickers = universe[universe.AssetClass == "Equity"]["Ticker"].dropna().tolist()
-    capm_df, benchmark_used = build_market_data(tuple(equity_tickers))
+def build_full_weights(persona):
+    a = alloc_results[persona]
+    w = capm_df["EquitySleeveWeight"] * a["EquityWeight"]
+    w.name = persona
+    bond_rows = pd.Series({
+        "GSEC2029": a["BondWeight"] * 0.5,
+        "EBBETF0431.NS": a["BondWeight"] * 0.5,
+        "GOLDBEES.NS": a["GoldSilverWeight"] * 0.5,
+        "SILVERBEES.NS": a["GoldSilverWeight"] * 0.5,
+    }, name=persona)
+    return pd.concat([w, bond_rows])
 
-    # Risk-adjusted equity sleeve weights:
-    # inverse-beta score, bounded and renormalised.
-    MIN_W, MAX_W = 0.04, 0.14
+full_weights = pd.concat([build_full_weights(p) for p in PERSONAS], axis=1)
+full_weights_rupees = (full_weights * CORPUS).round(0)
 
-    beta_for_weighting = capm_df["Beta"].clip(lower=0.2)
-    inv_beta = 1 / beta_for_weighting
-    raw_w = inv_beta / inv_beta.sum()
-    raw_w = raw_w.clip(lower=MIN_W, upper=MAX_W)
-    equity_sleeve_weight = raw_w / raw_w.sum()
+names_map = universe["Name"].to_dict()
+names_map["GSEC2029"] = "6.03% GOI G-Sec 2029"
 
-    capm_df["EquitySleeveWeight"] = equity_sleeve_weight
+# --- Streamlit Dashboard ---
+st.set_page_config(layout="wide", page_title="Portfolio Allocation Dashboard")
+st.title("Persona-Based Portfolio Allocation")
+st.markdown("This dashboard provides a persona-based asset allocation strategy for a ₹1 Crore corpus over a 3-year horizon, assuming investment on **August 31st, 2026**.")
 
-    equity_expected_capm = (
-        capm_df["EquitySleeveWeight"] * capm_df["CAPM_Return"]
-    ).sum()
-
-    equity_expected_dividend = (
-        capm_df["EquitySleeveWeight"] * capm_df["DividendYield"]
-    ).sum()
-
-    # Separate precious-metal return estimates.
-    metals_hist = fetch_history(["GOLDBEES.NS", "SILVERBEES.NS"])
-    metal_returns = {}
-
-    for ticker in ["GOLDBEES.NS", "SILVERBEES.NS"]:
-        if ticker in metals_hist.columns:
-            px = metals_hist[ticker].dropna()
-            if len(px) >= 2:
-                yrs = (px.index[-1] - px.index[0]).days / 365.25
-                metal_returns[ticker] = (
-                    (px.iloc[-1] / px.iloc[0]) ** (1 / yrs) - 1
-                    if yrs > 0 and px.iloc[0] > 0
-                    else np.nan
-                )
-            else:
-                metal_returns[ticker] = np.nan
-        else:
-            metal_returns[ticker] = np.nan
-
-    gold_return = metal_returns.get("GOLDBEES.NS", np.nan)
-    silver_return = metal_returns.get("SILVERBEES.NS", np.nan)
-
-    # Fixed income assumptions for the locked instruments.
-    # These are explicit modelling inputs, not live bond pricing.
-    gsec_return = 0.0625
-    bharat_bond_return = 0.0710
-    bond_blended_return = (gsec_return + bharat_bond_return) / 2
-
-    # Current design assumption: 4% gold + 4% silver.
-    GOLD_WEIGHT = 0.04
-    SILVER_WEIGHT = 0.04
-
-    persona_bond_floor = {
-        "Aggressive": 0.05,
-        "Moderate": 0.15,
-        "Conservative": 0.30,
-    }
-    persona_bond_cap = {
-        "Aggressive": 0.15,
-        "Moderate": 0.35,
-        "Conservative": 0.55,
-    }
-
-    alloc_results = {}
-
-    # Use separate gold and silver returns. If missing, fall back to 0%.
-    gold_return_used = 0.0 if pd.isna(gold_return) else float(gold_return)
-    silver_return_used = 0.0 if pd.isna(silver_return) else float(silver_return)
-
-    metals_return = (
-        GOLD_WEIGHT * gold_return_used +
-        SILVER_WEIGHT * silver_return_used
-    )
-    fixed_metals_weight = GOLD_WEIGHT + SILVER_WEIGHT
-    investable = 1 - fixed_metals_weight
-
-    for persona, p in PERSONAS.items():
-        target = p["target_cagr"]
-
-        denominator = equity_expected_capm - bond_blended_return
-        if abs(denominator) < 1e-9:
-            equity_weight = investable
-        else:
-            numerator = (
-                target
-                - metals_return
-                - investable * bond_blended_return
-            )
-            equity_weight = numerator / denominator
-
-        min_equity = investable - persona_bond_cap[persona]
-        max_equity = investable - persona_bond_floor[persona]
-        equity_weight = float(np.clip(equity_weight, min_equity, max_equity))
-        bond_weight = investable - equity_weight
-
-        achieved = (
-            equity_weight * equity_expected_capm
-            + bond_weight * bond_blended_return
-            + metals_return
-        )
-
-        alloc_results[persona] = {
-            "EquityWeight": equity_weight,
-            "BondWeight": bond_weight,
-            "GoldWeight": GOLD_WEIGHT,
-            "SilverWeight": SILVER_WEIGHT,
-            "TargetCAGR": target,
-            "AchievedCAGR": achieved,
-            "Feasible": abs(achieved - target) < 0.005,
-        }
-
-    def build_full_weights(persona):
-        a = alloc_results[persona]
-
-        equity_weights = capm_df["EquitySleeveWeight"] * a["EquityWeight"]
-
-        other_weights = pd.Series({
-            "GSEC2029": a["BondWeight"] * 0.50,
-            "EBBETF0431.NS": a["BondWeight"] * 0.50,
-            "GOLDBEES.NS": a["GoldWeight"],
-            "SILVERBEES.NS": a["SilverWeight"],
-        })
-
-        return pd.concat([equity_weights, other_weights])
-
-    full_weights = pd.concat(
-        {persona: build_full_weights(persona) for persona in PERSONAS},
-        axis=1
-    )
-
-    # Ensure all 15 instruments exist in every persona column.
-    expected_index = [
-        *equity_tickers,
-        "GSEC2029",
-        "EBBETF0431.NS",
-        "GOLDBEES.NS",
-        "SILVERBEES.NS",
-    ]
-    full_weights = full_weights.reindex(expected_index).fillna(0.0)
-
-    return (
-        capm_df,
-        benchmark_used,
-        equity_expected_capm,
-        equity_expected_dividend,
-        bond_blended_return,
-        gold_return_used,
-        silver_return_used,
-        alloc_results,
-        full_weights,
-    )
-
-
-# ============================================================
-# UI
-# ============================================================
-st.title("📊 Persona-Based Investment Portfolio Dashboard")
-st.caption(
-    "₹1 crore corpus • 3-year horizon • 11 equities + 2 bonds + 1 gold + 1 silver"
+selected_persona = st.sidebar.selectbox(
+    "Select a Persona:",
+    list(PERSONAS.keys())
 )
-
-with st.sidebar:
-    st.header("Portfolio Controls")
-    selected_persona = st.selectbox(
-        "Select investor persona",
-        list(PERSONAS.keys()),
-        index=1,
-    )
-
-    st.divider()
-    st.subheader("Model assumptions")
-    st.write(f"Risk-free rate: **{RISK_FREE_RATE:.1%}**")
-    st.write(f"Market return assumption: **{MARKET_RETURN:.1%}**")
-    st.write(f"Historical lookback: **{LOOKBACK_YEARS} years**")
-
-    if st.button("🔄 Refresh live market data"):
-        st.cache_data.clear()
-        st.rerun()
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-try:
-    with st.spinner("Downloading live market data and calculating risk metrics..."):
-        (
-            capm_df,
-            benchmark_used,
-            equity_expected_capm,
-            equity_expected_dividend,
-            bond_blended_return,
-            gold_return,
-            silver_return,
-            alloc_results,
-            full_weights,
-        ) = calculate_portfolio()
-except Exception as exc:
-    st.error("The dashboard could not build the live market dataset.")
-    st.exception(exc)
-    st.stop()
 
 a = alloc_results[selected_persona]
-target = PERSONAS[selected_persona]["target_corpus"]
-expected_final = CORPUS * (1 + a["AchievedCAGR"]) ** HORIZON_YEARS
-required_cagr = a["TargetCAGR"]
 
-# ============================================================
-# KPI CARDS
-# ============================================================
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Starting Corpus", "₹1.00 Cr")
-k2.metric("Target Corpus", f"₹{target/1e7:.2f} Cr")
-k3.metric("Required CAGR", f"{required_cagr:.1%}")
-k4.metric("Modelled CAGR", f"{a['AchievedCAGR']:.1%}")
-k5.metric("Modelled 3Y Corpus", f"₹{expected_final/1e7:.2f} Cr")
+st.sidebar.subheader("Persona Details")
+st.sidebar.write(f"**Target Corpus:** ₹{PERSONAS[selected_persona]['target_corpus']:,.0f}")
+st.sidebar.write(f"**Target CAGR:** {a['TargetCAGR']*100:.1f}%")
+st.sidebar.write(f"**Achieved CAGR:** {a['AchievedCAGR']*100:.1f}%")
+st.sidebar.write(f"**Feasible:** {'Yes' if a['Feasible'] else 'No'}")
 
-# ============================================================
-# ASSET ALLOCATION / CORPUS GROWTH
-# ============================================================
-left, right = st.columns(2)
 
-with left:
-    st.subheader(f"{selected_persona} — Asset Allocation")
+# Create two columns for the charts
+col1, col2 = st.columns(2)
 
-    weights = full_weights[selected_persona].copy()
-    names = universe["Name"].to_dict()
-    names["GSEC2029"] = "6.03% GOI G-Sec 2029"
-    weights.index = [names.get(i, i) for i in weights.index]
+with col1:
+    st.subheader(f"{selected_persona} — Instrument Allocation")
+    w = full_weights[selected_persona]
+    rupees = (w * CORPUS)
+    labels = [names_map.get(i, i) for i in w.index]
 
-    fig_pie = go.Figure(
-        data=[
-            go.Pie(
-                labels=weights.index,
-                values=(weights * CORPUS).values,
-                hole=0.45,
-                textinfo="percent",
-                hovertemplate="%{label}<br>₹%{value:,.0f}<br>%{percent}<extra></extra>",
-            )
-        ]
-    )
-    fig_pie.update_layout(
-        height=430,
-        template="plotly_white",
-        margin=dict(l=0, r=0, t=20, b=0),
-        legend=dict(orientation="v"),
-    )
+    fig_pie = go.Figure(data=[go.Pie(labels=labels, values=rupees.values, hole=0.45,
+                                    textinfo="label+percent", showlegend=True)])
+    fig_pie.update_layout(height=400, template="plotly_white", margin=dict(l=0, r=0, t=30, b=0))
     st.plotly_chart(fig_pie, use_container_width=True)
 
-with right:
-    st.subheader(f"{selected_persona} — 3-Year Corpus Projection")
-
+with col2:
+    st.subheader(f"{selected_persona} — Corpus Growth ({HORIZON_YEARS}Y)")
     years = np.arange(0, HORIZON_YEARS + 1)
-    modelled_path = CORPUS * (1 + a["AchievedCAGR"]) ** years
-    target_path = CORPUS * (1 + a["TargetCAGR"]) ** years
+    growth = CORPUS * (1 + a["AchievedCAGR"]) ** years
+    target_growth = CORPUS * (1 + a["TargetCAGR"]) ** years
 
     fig_line = go.Figure()
-    fig_line.add_trace(
-        go.Scatter(
-            x=years,
-            y=modelled_path,
-            mode="lines+markers",
-            name="Modelled",
-        )
-    )
-    fig_line.add_trace(
-        go.Scatter(
-            x=years,
-            y=target_path,
-            mode="lines",
-            name="Target",
-            line=dict(dash="dash"),
-        )
-    )
-    fig_line.update_layout(
-        height=430,
-        template="plotly_white",
-        xaxis_title="Year",
-        yaxis_title="Corpus (₹)",
-        hovermode="x unified",
-        margin=dict(l=0, r=0, t=20, b=0),
-        yaxis_tickprefix="₹",
-    )
+    fig_line.add_trace(go.Scatter(x=years, y=growth, mode="lines+markers", name="Modelled Path"))
+    fig_line.add_trace(go.Scatter(x=years, y=target_growth, mode="lines", name="Target Path", line=dict(dash="dash")))
+    fig_line.update_layout(height=400, template="plotly_white",
+                           xaxis_title="Year", yaxis_title="Corpus (₹)",
+                           margin=dict(l=0, r=0, t=30, b=0))
     st.plotly_chart(fig_line, use_container_width=True)
 
-# ============================================================
-# ASSET CLASS SUMMARY
-# ============================================================
-st.subheader("Asset-Class Allocation")
-
-asset_summary = pd.DataFrame({
-    "Asset Class": ["Equity", "Bonds", "Gold", "Silver"],
-    "Weight": [
-        a["EquityWeight"],
-        a["BondWeight"],
-        a["GoldWeight"],
-        a["SilverWeight"],
-    ],
-})
-asset_summary["Allocation (₹)"] = asset_summary["Weight"] * CORPUS
-asset_summary["Weight"] = asset_summary["Weight"].map(lambda x: f"{x:.1%}")
-asset_summary["Allocation (₹)"] = asset_summary["Allocation (₹)"].map(lambda x: f"₹{x:,.0f}")
-st.dataframe(asset_summary, use_container_width=True, hide_index=True)
-
-# ============================================================
-# CAPM / RISK TABLE
-# ============================================================
-st.subheader("Equity Risk & CAPM Analysis")
-
-risk_table = capm_df.reset_index().rename(columns={
-    "Ticker": "Ticker",
-    "Name": "Company",
-    "Sector": "Sector",
-    "LivePrice": "Live Price (₹)",
-    "Beta": "Beta",
-    "AnnVolatility": "Annual Volatility",
-    "CAPM_Return": "CAPM Expected Return",
-    "Realised5Y_CAGR": "Realised 5Y CAGR",
-    "DividendYield": "Dividend Yield",
-    "RiskBucket": "Risk Bucket",
-})
-
-risk_table["Live Price (₹)"] = risk_table["Live Price (₹)"].round(2)
-risk_table["Beta"] = risk_table["Beta"].round(2)
-risk_table["Annual Volatility"] = risk_table["Annual Volatility"].map(lambda x: f"{x:.1%}")
-risk_table["CAPM Expected Return"] = risk_table["CAPM Expected Return"].map(lambda x: f"{x:.1%}")
-risk_table["Realised 5Y CAGR"] = risk_table["Realised 5Y CAGR"].map(
-    lambda x: f"{x:.1%}" if pd.notna(x) else "N/A"
-)
-risk_table["Dividend Yield"] = risk_table["Dividend Yield"].map(lambda x: f"{x:.1%}")
-
-st.dataframe(
-    risk_table[[
-        "Company", "Sector", "Live Price (₹)", "Beta",
-        "Annual Volatility", "CAPM Expected Return",
-        "Realised 5Y CAGR", "Dividend Yield", "Risk Bucket"
-    ]],
-    use_container_width=True,
-    hide_index=True,
-)
-
-# ============================================================
-# RISK / RETURN SCATTER
-# ============================================================
-st.subheader("Expected Return vs Risk")
-
-scatter = go.Figure()
-for risk_bucket in capm_df["RiskBucket"].dropna().unique():
-    subset = capm_df[capm_df["RiskBucket"] == risk_bucket]
-    scatter.add_trace(
-        go.Scatter(
-            x=subset["AnnVolatility"],
-            y=subset["CAPM_Return"],
-            mode="markers+text",
-            text=subset["Name"],
-            textposition="top center",
-            name=str(risk_bucket),
-            hovertemplate=(
-                "%{text}<br>"
-                "Volatility: %{x:.1%}<br>"
-                "CAPM Return: %{y:.1%}<extra></extra>"
-            ),
-        )
-    )
-
-scatter.update_layout(
-    template="plotly_white",
-    height=500,
-    xaxis_title="Annualised Volatility",
-    yaxis_title="CAPM Expected Return",
-)
-st.plotly_chart(scatter, use_container_width=True)
-
-# ============================================================
-# INSTRUMENT-LEVEL ALLOCATION
-# ============================================================
-st.subheader(f"{selected_persona} — ₹ Allocation by Instrument")
-
-alloc_table = pd.DataFrame({
-    "Instrument": [names.get(i, i) for i in full_weights.index],
-    "Weight": full_weights[selected_persona].values,
-})
-alloc_table["Allocation (₹)"] = alloc_table["Weight"] * CORPUS
-alloc_table["Weight"] = alloc_table["Weight"].map(lambda x: f"{x:.2%}")
-alloc_table["Allocation (₹)"] = alloc_table["Allocation (₹)"].map(lambda x: f"₹{x:,.0f}")
-
-st.dataframe(alloc_table, use_container_width=True, hide_index=True)
-
-# ============================================================
-# RETURN BREAKDOWN
-# ============================================================
-st.subheader("Contribution to Expected Return")
-
-equity_capital_gain = max(equity_expected_capm - equity_expected_dividend, 0.0)
+st.subheader("Contribution to Return Breakdown")
 breakdown = pd.DataFrame({
-    "Component": [
-        "Equity capital gains (CAPM)",
-        "Equity dividends",
-        "Bond interest / yield assumption",
-        "Gold appreciation",
-        "Silver appreciation",
-    ],
-    "Contribution": [
-        a["EquityWeight"] * equity_capital_gain,
-        a["EquityWeight"] * equity_expected_dividend,
+    "Component": ["Equity capital gains", "Equity dividends", "Bond interest (YTM)", "Gold/Silver appreciation"],
+    "Contribution to return": [
+        a["EquityWeight"] * (equity_expected_return - equity_expected_divyld),
+        a["EquityWeight"] * equity_expected_divyld,
         a["BondWeight"] * bond_blended_return,
-        a["GoldWeight"] * gold_return,
-        a["SilverWeight"] * silver_return,
-    ],
-})
-breakdown["Contribution"] = breakdown["Contribution"].map(lambda x: f"{x:.2%}")
-st.dataframe(breakdown, use_container_width=True, hide_index=True)
+        a["GoldSilverWeight"] * gold_silver_return,
+    ]})
+breakdown["Contribution to return"] = (breakdown["Contribution to return"] * 100).round(2).astype(str) + "%"
+st.dataframe(breakdown.style.hide(axis="index"), use_container_width=True)
 
-# ============================================================
-# MODEL NOTES
-# ============================================================
-with st.expander("Methodology & limitations"):
-    st.markdown(
-        """
-        **Selection universe:** 11 fixed equities, 2 fixed-income instruments,
-        1 gold ETF and 1 silver ETF.
-
-        **CAPM:** Expected equity return is estimated as
-        Risk-free rate + Beta × (Market return − Risk-free rate).
-
-        **Equity sleeve weighting:** inverse-beta weighting, subject to a
-        4% minimum and 14% maximum per stock, then normalised.
-
-        **Dividends:** Yahoo Finance dividend yield is treated as a decimal
-        rate and included separately from capital gains.
-
-        **Bonds:** the two bond instruments currently use explicit modelling
-        assumptions (6.25% for the G-Sec and 7.10% for the Bharat Bond ETF)
-        rather than live bond-yield pulls.
-
-        **Gold and silver:** historical annualised price returns are estimated
-        separately from Yahoo Finance. They are not assumed to be equivalent.
-
-        **Important:** This is an analytical model, not investment advice.
-        Historical returns and model assumptions do not guarantee future results.
-        """
-    )
-
-st.caption(
-    f"Benchmark used for beta estimation: {benchmark_used}. "
-    "Click 'Refresh live market data' in the sidebar to clear the cache."
-)
+st.subheader("Rupee Allocation per Instrument")
+rupee_alloc_df = full_weights_rupees[[selected_persona]].rename(index=names_map).rename(columns={selected_persona: "₹ Allocation"})
+st.dataframe(rupee_alloc_df, use_container_width=True)
