@@ -8,6 +8,9 @@ import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
+from streamlit_autorefresh import st_autorefresh
 from scipy.optimize import minimize
 
 warnings.filterwarnings("ignore")
@@ -21,6 +24,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# The browser session refreshes once per day while the dashboard is open.
+# Data is also refreshed on each new visit when the cache is stale.
+st_autorefresh(interval=24 * 60 * 60 * 1000, key="daily_dashboard_refresh")
+TODAY = pd.Timestamp.now().normalize()
 
 # ============================================================
 # 2. LIGHT DESIGN TOKENS
@@ -323,7 +331,7 @@ INSTRUMENTS_MASTER = [
 # ============================================================
 # 5. LIVE DATA ENGINE
 # ============================================================
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
 def fetch_live_market_data(lookback_yrs=5):
     tickers = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Ticker"] != "GSEC2029"]
     # Nifty 50 is the benchmark used by the current CAPM implementation.
@@ -352,6 +360,31 @@ def fetch_live_market_data(lookback_yrs=5):
     if getattr(prices.index, "tz", None) is not None:
         prices.index = prices.index.tz_localize(None)
 
+    return prices.sort_index().dropna(how="all")
+
+
+
+@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
+def fetch_daily_prices():
+    """Recent daily closes for day-over-day price changes and current value."""
+    tickers = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Ticker"] != "GSEC2029"]
+    raw = yf.download(
+        tickers,
+        period="15d",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+    )
+    if raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw.xs("Close", level=1, axis=1)
+    else:
+        prices = raw.copy()
+    prices.index = pd.to_datetime(prices.index)
+    if getattr(prices.index, "tz", None) is not None:
+        prices.index = prices.index.tz_localize(None)
     return prices.sort_index().dropna(how="all")
 
 
@@ -389,6 +422,211 @@ def fetch_dividend_yield(ticker):
         return div / 100.0 if div > 1 else div
     except Exception:
         return 0.0
+
+
+
+@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
+def fetch_dividend_history_and_events(start_date, end_date):
+    """
+    Builds the dividend cash-flow history from yfinance.
+
+    yfinance provides declared dividend amounts as corporate-action/ex-dividend
+    events. It does not reliably expose the issuer's board-announcement date.
+    Where NSE's public corporate-action page is accessible, the app also tries
+    to capture the NSE corporate-action record. The UI labels the date correctly
+    so ex-dates are never presented as declaration dates.
+    """
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    rows = []
+    equity_items = [x for x in INSTRUMENTS_MASTER if x["Type"] == "Equity"]
+
+    for item in equity_items:
+        ticker = item["Ticker"]
+        symbol = ticker.replace(".NS", "")
+
+        # Yahoo dividend history: event date is normally the ex-dividend date.
+        try:
+            div = yf.Ticker(ticker).dividends
+            div.index = pd.to_datetime(div.index)
+            if getattr(div.index, "tz", None) is not None:
+                div.index = div.index.tz_localize(None)
+            div = div[(div.index >= start_date) & (div.index <= end_date)]
+        except Exception:
+            div = pd.Series(dtype=float)
+
+        if div.empty:
+            rows.append({
+                "Company": item["Name"],
+                "Symbol": symbol,
+                "Dividend / Share": np.nan,
+                "Ex-Date": pd.NaT,
+                "NSE Announcement Date": pd.NaT,
+                "Record Date": pd.NaT,
+                "Source": "Yahoo Finance (no dividend event in period)",
+            })
+            continue
+
+        for event_date, amount in div.items():
+            rows.append({
+                "Company": item["Name"],
+                "Symbol": symbol,
+                "Dividend / Share": float(amount),
+                "Ex-Date": pd.Timestamp(event_date),
+                "NSE Announcement Date": pd.NaT,
+                "Record Date": pd.NaT,
+                "Source": "Yahoo Finance dividend action",
+            })
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
+def fetch_nse_dividend_actions(symbols):
+    """
+    Best-effort NSE cross-check.
+
+    1) Corporate Actions page: dividend purpose + ex-date + record date.
+    2) Corporate Announcements page: latest dividend-related broadcast date
+       when the public page exposes it.
+
+    The exchange data is used as a cross-check. We label the broadcast date
+    separately from the ex-date so the dashboard never confuses the two.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/126.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.nseindia.com/",
+    }
+
+    action_rows = []
+    announcement_rows = []
+    session = requests.Session()
+
+    try:
+        session.get("https://www.nseindia.com/", headers=headers, timeout=12)
+    except Exception:
+        pass
+
+    for symbol in symbols:
+        # ---------------- Corporate Actions ----------------
+        action_url = (
+            "https://www.nseindia.com/companies-listing/"
+            f"corporate-filings-actions?symbol={symbol}&tabIndex=equity"
+        )
+        try:
+            r = session.get(action_url, headers=headers, timeout=12)
+            r.raise_for_status()
+            tables = pd.read_html(r.text)
+
+            for table in tables:
+                cols = [str(c).upper() for c in table.columns]
+                if not (
+                    any("PURPOSE" in c for c in cols)
+                    and any("EX-DATE" in c for c in cols)
+                ):
+                    continue
+
+                table.columns = [str(c).strip() for c in table.columns]
+                for _, row in table.iterrows():
+                    purpose = str(row.get("PURPOSE", ""))
+                    if "DIVIDEND" not in purpose.upper():
+                        continue
+
+                    action_rows.append({
+                        "Symbol": symbol,
+                        "NSE Purpose": purpose,
+                        "NSE Ex-Date": pd.to_datetime(
+                            row.get("EX-DATE"), errors="coerce"
+                        ),
+                        "NSE Record Date": pd.to_datetime(
+                            row.get("RECORD DATE"), errors="coerce"
+                        ),
+                    })
+                break
+        except Exception:
+            pass
+
+        # ---------------- Corporate Announcements ----------------
+        announcement_url = (
+            "https://www.nseindia.com/companies-listing/"
+            f"corporate-filings-announcements?symbol={symbol}"
+        )
+        try:
+            r = session.get(announcement_url, headers=headers, timeout=12)
+            r.raise_for_status()
+            tables = pd.read_html(r.text)
+
+            for table in tables:
+                table.columns = [str(c).strip() for c in table.columns]
+                upper_cols = [c.upper() for c in table.columns]
+
+                subject_col = next(
+                    (c for c in table.columns if "SUBJECT" in c.upper()), None
+                )
+                date_col = next(
+                    (
+                        c for c in table.columns
+                        if ("BROADCAST" in c.upper() or "ANNOUNCEMENT" in c.upper())
+                    ),
+                    None,
+                )
+                if subject_col is None or date_col is None:
+                    continue
+
+                for _, row in table.iterrows():
+                    subject = str(row.get(subject_col, ""))
+                    if "DIVIDEND" not in subject.upper():
+                        continue
+
+                    announcement_rows.append({
+                        "Symbol": symbol,
+                        "NSE Announcement Date": pd.to_datetime(
+                            row.get(date_col), errors="coerce"
+                        ),
+                        "NSE Announcement Subject": subject,
+                    })
+                break
+        except Exception:
+            pass
+
+    actions = pd.DataFrame(action_rows)
+    announcements = pd.DataFrame(announcement_rows)
+
+    if actions.empty and announcements.empty:
+        return pd.DataFrame(
+            columns=[
+                "Symbol", "NSE Purpose", "NSE Ex-Date", "NSE Record Date",
+                "NSE Announcement Date", "NSE Announcement Subject"
+            ]
+        )
+
+    if actions.empty:
+        result = announcements.copy()
+    elif announcements.empty:
+        result = actions.copy()
+    else:
+        # Keep the latest announcement per symbol; NSE's public page typically
+        # returns only the most recent batch for this view.
+        latest_announcement = (
+            announcements.sort_values("NSE Announcement Date")
+            .groupby("Symbol", as_index=False)
+            .tail(1)
+        )
+        result = actions.merge(
+            latest_announcement,
+            on="Symbol",
+            how="left",
+        )
+
+    return result
+
+
 
 
 def analyze_live_performance(prices_df, rf_rate, mkt_return):
@@ -628,11 +866,13 @@ def build_persona_weights(df_master, persona_name, returns_df):
     if eq_total > 0:
         out.loc[eq_idx, "EquitySleeveWeight"] = weights[eq_idx] / eq_total
 
-    # As-of 31 Aug 2026 inception valuation.
+    # Fix the initial holdings at the 31 Aug 2026 investment-date price.
+    # Future refreshes update CurrentPrice/CurrentValue but do not recalculate units.
+    # This is what allows the dashboard to show genuine portfolio P&L over time.
     out["EntryPrice"] = out["LivePrice"]
     out["Units"] = np.where(
-        out["LivePrice"].notna() & (out["LivePrice"] > 0),
-        out["Allocated_Amount"] / out["LivePrice"],
+        out["EntryPrice"].notna() & (out["EntryPrice"] > 0),
+        out["Allocated_Amount"] / out["EntryPrice"],
         np.nan,
     )
     out["CurrentValue"] = out["Units"] * out["LivePrice"]
@@ -718,7 +958,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Valuation / investment date: 31 Aug 2026")
+    st.caption("Investment date: 31 Aug 2026 · Market data refreshes daily while the dashboard is open")
     st.caption("Persona targets determine the required CAGR constraint; the optimizer then minimizes risk within persona-specific allocation guardrails.")
 
 # ============================================================
@@ -727,6 +967,7 @@ with st.sidebar:
 try:
     with st.spinner("Downloading market data & computing risk/return metrics..."):
         prices_df = fetch_live_market_data(lookback_yrs)
+        daily_prices_df = fetch_daily_prices()
         df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
         df_master, optimization_meta = build_persona_weights(df_master_raw, selected_persona, returns_df)
 except Exception as e:
@@ -738,9 +979,131 @@ persona_cfg = PERSONAS[selected_persona]
 target_cagr = persona_cfg["target_cagr"]
 
 # ============================================================
-# 8. PORTFOLIO METRICS
+# 8. PORTFOLIO LIVE MARK-TO-MARKET + DIVIDENDS
 # ============================================================
-current_portfolio_value = float(df_master["CurrentValue"].sum(skipna=True))
+# Re-mark the fixed 31 Aug 2026 holdings to the latest available price.
+latest_prices = {}
+previous_prices = {}
+
+for _, row in df_master.iterrows():
+    ticker = row["Ticker"]
+    if ticker == "GSEC2029":
+        latest_prices[ticker] = 100.0
+        previous_prices[ticker] = 100.0
+        continue
+
+    if ticker in daily_prices_df.columns:
+        s = daily_prices_df[ticker].dropna()
+        if len(s) >= 1:
+            latest_prices[ticker] = float(s.iloc[-1])
+        if len(s) >= 2:
+            previous_prices[ticker] = float(s.iloc[-2])
+
+df_master["CurrentPrice"] = df_master.apply(
+    lambda r: latest_prices.get(r["Ticker"], r["LivePrice"]), axis=1
+)
+df_master["PreviousClose"] = df_master.apply(
+    lambda r: previous_prices.get(r["Ticker"], r["CurrentPrice"]), axis=1
+)
+
+df_master["CurrentValue"] = df_master["Units"] * df_master["CurrentPrice"]
+df_master["DailyPriceChange"] = df_master["CurrentPrice"] - df_master["PreviousClose"]
+df_master["DailyPriceChangePct"] = np.where(
+    df_master["PreviousClose"].notna() & (df_master["PreviousClose"] != 0),
+    df_master["DailyPriceChange"] / df_master["PreviousClose"],
+    0.0,
+)
+
+# Dividend tracker — cash dividends received since the 31 Aug 2026 investment date.
+div_hist = fetch_dividend_history_and_events(
+    pd.Timestamp("2026-08-31"),
+    TODAY,
+)
+
+if not div_hist.empty:
+    units_map = df_master.set_index("Ticker")["Units"].to_dict()
+    symbol_to_ticker = {
+        item["Ticker"].replace(".NS", ""): item["Ticker"]
+        for item in INSTRUMENTS_MASTER
+        if item["Type"] == "Equity"
+    }
+    div_hist["Ticker"] = div_hist["Symbol"].map(symbol_to_ticker)
+    div_hist["Units"] = div_hist["Ticker"].map(units_map)
+    div_hist["Cash Dividend"] = div_hist["Dividend / Share"] * div_hist["Units"]
+else:
+    div_hist = pd.DataFrame(
+        columns=["Company", "Symbol", "Dividend / Share", "Ex-Date",
+                 "NSE Announcement Date", "Record Date", "Source",
+                 "Ticker", "Units", "Cash Dividend"]
+    )
+
+# NSE cross-check for declaration/broadcast information.
+try:
+    portfolio_symbols = [
+        item["Ticker"].replace(".NS", "")
+        for item in INSTRUMENTS_MASTER
+        if item["Type"] == "Equity"
+    ]
+    nse_div = fetch_nse_dividend_actions(portfolio_symbols)
+except Exception:
+    nse_div = pd.DataFrame()
+
+if not nse_div.empty:
+    # Merge the nearest NSE ex-date information to the Yahoo event.
+    div_hist["NSE Announcement Date"] = pd.NaT
+    div_hist["NSE Record Date"] = pd.NaT
+    div_hist["NSE Announcement Subject"] = ""
+
+    for i, drow in div_hist.iterrows():
+        symbol = drow.get("Symbol")
+        ex_date = drow.get("Ex-Date")
+        candidates = nse_div[nse_div["Symbol"] == symbol].copy()
+
+        if not candidates.empty and pd.notna(ex_date):
+            if "NSE Ex-Date" in candidates:
+                candidates["date_diff"] = (
+                    pd.to_datetime(candidates["NSE Ex-Date"], errors="coerce")
+                    - pd.Timestamp(ex_date)
+                ).abs().dt.days
+                candidates = candidates.sort_values("date_diff")
+
+            best = candidates.iloc[0]
+            div_hist.at[i, "NSE Announcement Date"] = best.get(
+                "NSE Announcement Date", pd.NaT
+            )
+            div_hist.at[i, "NSE Record Date"] = best.get(
+                "NSE Record Date", pd.NaT
+            )
+            div_hist.at[i, "NSE Announcement Subject"] = best.get(
+                "NSE Announcement Subject", ""
+            )
+
+dividend_cash_received = float(
+    pd.to_numeric(
+        div_hist.get("Cash Dividend", pd.Series(dtype=float)),
+        errors="coerce"
+    ).fillna(0).sum()
+)
+
+df_master["DividendCashReceived"] = 0.0
+if not div_hist.empty:
+    cash_by_ticker = div_hist.groupby("Ticker")["Cash Dividend"].sum()
+    df_master["DividendCashReceived"] = df_master["Ticker"].map(cash_by_ticker).fillna(0.0)
+
+df_master["TotalCurrentValue"] = df_master["CurrentValue"] + df_master["DividendCashReceived"]
+df_master["TotalInvestmentGain"] = (
+    df_master["TotalCurrentValue"] - df_master["Allocated_Amount"]
+)
+df_master["TotalInvestmentGainPct"] = np.where(
+    df_master["Allocated_Amount"] != 0,
+    df_master["TotalInvestmentGain"] / df_master["Allocated_Amount"],
+    0.0,
+)
+
+# ============================================================
+# 9. PORTFOLIO METRICS
+# ============================================================
+current_portfolio_value = float(df_master["TotalCurrentValue"].sum(skipna=True))
 invested_capital = float(df_master["Allocated_Amount"].sum())
 current_pnl = current_portfolio_value - invested_capital
 current_pnl_pct = current_pnl / invested_capital if invested_capital else 0.0
@@ -805,7 +1168,7 @@ with hero_l:
     st.markdown(
         f"""
         <div class="hero-wrap">
-            <div class="hero-eyebrow">PORTFOLIO SNAPSHOT · 31 AUG 2026 · {lookback_yrs}Y LOOKBACK</div>
+            <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {TODAY.strftime("%d %b %Y")} · INVESTED 31 AUG 2026 · {lookback_yrs}Y LOOKBACK</div>
             <div class="hero-title">15-Asset Allocation Terminal</div>
             <p class="hero-sub">
                 ₹1.00 Cr allocated across 11 equities, 2 bonds, Gold ETF and Silver ETF for the
@@ -940,10 +1303,10 @@ selected_instrument = st.selectbox(
 selected_row = df_master.loc[df_master["Name"].eq(selected_instrument)].iloc[0]
 
 i1, i2, i3, i4 = st.columns(4)
-i1.metric("Current Price", f"₹{selected_row['LivePrice']:,.2f}" if pd.notna(selected_row["LivePrice"]) else "N/A")
+i1.metric("Current Price", f"₹{selected_row['CurrentPrice']:,.2f}" if pd.notna(selected_row["CurrentPrice"]) else "N/A")
 i2.metric("Portfolio Weight", f"{selected_row['Portfolio_Weight']:.2%}")
 i3.metric("Allocated", f"₹{selected_row['Allocated_Amount']/1e5:.2f} L")
-i4.metric("Current Value", f"₹{selected_row['CurrentValue']/1e5:.2f} L" if pd.notna(selected_row["CurrentValue"]) else "N/A")
+i4.metric("Current Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
 
 detail_left, detail_right = st.columns([1, 1.4])
 
@@ -954,6 +1317,8 @@ with detail_left:
         "Cap Category": selected_row["CapCategory"],
         "Price Date": str(pd.Timestamp(selected_row["PriceDate"]).date()) if pd.notna(selected_row["PriceDate"]) else "N/A",
         "Units": f"{selected_row['Units']:,.4f}" if pd.notna(selected_row["Units"]) else "N/A",
+        "Daily Price Change": f"{selected_row['DailyPriceChangePct']:+.2%}",
+        "Dividend Cash Received": f"₹{selected_row['DividendCashReceived']:,.0f}",
         "Beta": f"{selected_row['Beta']:.2f}",
         "Volatility": f"{selected_row['Volatility']:.2%}",
         "Historical CAGR": f"{selected_row['Actual_CAGR']:.2%}",
@@ -1107,9 +1472,51 @@ with tab_overview:
     st.plotly_chart(fig_return, use_container_width=True)
 
     st.markdown(
-        '<div class="info-box">Day-0 interpretation: because the portfolio is assumed to be purchased at the 31 Aug 2026 valuation price, the current market value equals the ₹1 Cr starting corpus at inception and the unrealised P&amp;L starts at zero. Future return is then modelled from the selected risk profile.</div>',
+        '<div class="info-box">The investment is assumed to be initiated on 31 Aug 2026. Holdings are fixed at their entry prices; daily refreshes then re-mark those holdings to the latest market price and add declared/recorded dividend cash flows to total portfolio value.</div>',
         unsafe_allow_html=True,
     )
+
+    st.markdown('<div class="section-title">Daily Market Movement</div>', unsafe_allow_html=True)
+    daily_move = df_master[["Name", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]].copy()
+    daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False)
+    st.dataframe(
+        daily_move,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "CurrentPrice": st.column_config.NumberColumn("Current Price", format="₹%.2f"),
+            "DailyPriceChange": st.column_config.NumberColumn("₹ Change", format="₹%.2f"),
+            "DailyPriceChangePct": st.column_config.NumberColumn("Daily Change", format="%.2f%%"),
+        },
+    )
+
+    st.markdown('<div class="section-title">Dividend Tracker</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-note">Dividend events affecting the portfolio since the 31 Aug 2026 investment date. Ex-date is the corporate-action date used for dividend entitlement. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
+        unsafe_allow_html=True,
+    )
+    if not div_hist.empty:
+        dividend_view = div_hist[[
+            "Company", "Dividend / Share", "NSE Announcement Date",
+            "NSE Announcement Subject", "Ex-Date", "Record Date",
+            "Cash Dividend", "Source"
+        ]].copy()
+        st.dataframe(
+            dividend_view.sort_values("Ex-Date", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Dividend / Share": st.column_config.NumberColumn(format="₹%.2f"),
+                "NSE Announcement Date": st.column_config.DateColumn(
+                    "NSE Announcement / Broadcast", format="DD MMM YYYY"
+                ),
+                "Ex-Date": st.column_config.DateColumn(format="DD MMM YYYY"),
+                "Record Date": st.column_config.DateColumn(format="DD MMM YYYY"),
+                "Cash Dividend": st.column_config.NumberColumn(format="₹%d"),
+            },
+        )
+    else:
+        st.info("No dividend event has been recorded since the 31 Aug 2026 investment date.")
 
 # ---------- TAB 2: HOLDINGS ----------
 with tab_holdings:
@@ -1120,8 +1527,11 @@ with tab_holdings:
     )
 
     display_df = df_master.copy()
-    display_df["Current Price"] = display_df["LivePrice"]
+    display_df["Current Price"] = display_df["CurrentPrice"]
     display_df["Price Date"] = display_df["PriceDate"]
+    display_df["Daily Change %"] = display_df["DailyPriceChangePct"]
+    display_df["Dividend Cash"] = display_df["DividendCashReceived"]
+    display_df["Total Gain"] = display_df["TotalInvestmentGain"]
     display_df["Historical CAGR"] = display_df["Actual_CAGR"]
     display_df["Dividend / Interest"] = display_df["ExpectedIncomeYield"]
     display_df["Capital Gain"] = display_df["CapitalGainExpected"]
@@ -1130,8 +1540,8 @@ with tab_holdings:
     cols = [
         "Name", "Type", "Sector", "CapCategory", "Current Price", "Price Date",
         "Units", "Portfolio_Weight", "Allocated_Amount", "CurrentValue",
-        "UnrealizedPnL", "Historical CAGR", "Capital Gain", "Dividend / Interest",
-        "Expected Total Return", "Beta",
+        "Dividend Cash", "Total Gain", "Daily Change %", "Historical CAGR",
+        "Capital Gain", "Dividend / Interest", "Expected Total Return", "Beta",
     ]
 
     st.dataframe(
@@ -1150,7 +1560,10 @@ with tab_holdings:
             ),
             "Allocated_Amount": st.column_config.NumberColumn("Invested", format="₹%d"),
             "CurrentValue": st.column_config.NumberColumn("Current Value", format="₹%d"),
-            "UnrealizedPnL": st.column_config.NumberColumn("P&L", format="₹%d"),
+            "UnrealizedPnL": st.column_config.NumberColumn("Price P&L", format="₹%d"),
+            "Dividend Cash": st.column_config.NumberColumn(format="₹%d"),
+            "Total Gain": st.column_config.NumberColumn(format="₹%d"),
+            "Daily Change %": st.column_config.NumberColumn(format="%.2f%%"),
             "Historical CAGR": st.column_config.NumberColumn(format="%.2f%%"),
             "Capital Gain": st.column_config.NumberColumn(format="%.2f%%"),
             "Dividend / Interest": st.column_config.NumberColumn(format="%.2f%%"),
@@ -1190,10 +1603,10 @@ with tab_holdings:
     with h2:
         st.markdown('<div class="section-title">Current Value by Asset Class</div>', unsafe_allow_html=True)
         asset_value_df = pd.DataFrame([
-            {"Asset Class": "Equity", "Current Value": df_master.loc[equity_mask, "CurrentValue"].sum()},
-            {"Asset Class": "Bond", "Current Value": df_master.loc[bond_mask, "CurrentValue"].sum()},
-            {"Asset Class": "Gold", "Current Value": df_master.loc[gold_mask, "CurrentValue"].sum()},
-            {"Asset Class": "Silver", "Current Value": df_master.loc[silver_mask, "CurrentValue"].sum()},
+            {"Asset Class": "Equity", "Current Value": df_master.loc[equity_mask, "TotalCurrentValue"].sum()},
+            {"Asset Class": "Bond", "Current Value": df_master.loc[bond_mask, "TotalCurrentValue"].sum()},
+            {"Asset Class": "Gold", "Current Value": df_master.loc[gold_mask, "TotalCurrentValue"].sum()},
+            {"Asset Class": "Silver", "Current Value": df_master.loc[silver_mask, "TotalCurrentValue"].sum()},
         ])
         fig_asset = px.bar(
             asset_value_df,
@@ -1394,6 +1807,6 @@ with tab_history:
 
 st.write("")
 st.caption(
-    f"Educational/simulation dashboard. Current value is an as-of 31 Aug 2026 inception snapshot. "
+    f"Educational/simulation dashboard. Current value is marked to the latest available trading price; holdings are fixed from the 31 Aug 2026 investment date. "
     f"Historical CAGR, beta and CAPM metrics are model estimates and should not be treated as guaranteed future returns."
 )
