@@ -9,9 +9,20 @@ import plotly.io as pio
 import streamlit as st
 import yfinance as yf
 import requests
-from bs4 import BeautifulSoup
-from streamlit_autorefresh import st_autorefresh
 from scipy.optimize import minimize
+
+# Optional dependency guard: the app will still start if Streamlit Cloud
+# has not installed the auto-refresh package yet.
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTO_REFRESH_AVAILABLE = True
+except ImportError:
+    AUTO_REFRESH_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 warnings.filterwarnings("ignore")
 
@@ -25,9 +36,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# The browser session refreshes once per day while the dashboard is open.
-# Data is also refreshed on each new visit when the cache is stale.
-st_autorefresh(interval=24 * 60 * 60 * 1000, key="daily_dashboard_refresh")
+# The browser session refreshes once per day while the dashboard is open
+# when streamlit-autorefresh is installed. Cache TTLs also expire daily.
+if AUTO_REFRESH_AVAILABLE:
+    st_autorefresh(interval=24 * 60 * 60 * 1000, key="daily_dashboard_refresh")
 TODAY = pd.Timestamp.now().normalize()
 
 # ============================================================
@@ -958,7 +970,13 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Investment date: 31 Aug 2026 · Market data refreshes daily while the dashboard is open")
+    refresh_note = (
+        "Daily auto-refresh enabled."
+        if AUTO_REFRESH_AVAILABLE
+        else "Daily auto-refresh unavailable in this environment; use the refresh button. "
+             "Market-data cache still expires daily."
+    )
+    st.caption("Investment date: 31 Aug 2026 · " + refresh_note)
     st.caption("Persona targets determine the required CAGR constraint; the optimizer then minimizes risk within persona-specific allocation guardrails.")
 
 # ============================================================
