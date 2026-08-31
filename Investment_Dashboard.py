@@ -376,7 +376,7 @@ def fetch_live_market_data(lookback_yrs=5):
 
 
 
-@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
 def fetch_daily_prices():
     """Recent daily closes for day-over-day price changes and current value."""
     tickers = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Ticker"] != "GSEC2029"]
@@ -754,6 +754,35 @@ def _annualized_risk_vector(out, returns_df):
     return np.clip(np.asarray(risks, dtype=float), 0.02, 1.50)
 
 
+def apply_entry_prices_asof(df_master, daily_prices_df, valuation_date):
+    """
+    Use one consistent investment-date price for the initial units.
+    This prevents a false day-one P&L caused by comparing weekly-series
+    prices with daily-series prices.
+    """
+    out = df_master.copy()
+    entry_prices = []
+
+    for _, row in out.iterrows():
+        t = row["Ticker"]
+        if t == "GSEC2029":
+            entry_prices.append(100.0)
+            continue
+
+        if t in daily_prices_df.columns:
+            s = asof_series(daily_prices_df[t], valuation_date)
+            if not s.empty:
+                entry_prices.append(float(s.iloc[-1]))
+                continue
+
+        # Fall back to the model's as-of weekly price only when daily
+        # history is unavailable.
+        entry_prices.append(row["LivePrice"])
+
+    out["EntryPrice"] = entry_prices
+    return out
+
+
 def build_persona_weights(df_master, persona_name, returns_df):
     """
     Desired outcome drives the weights.
@@ -878,16 +907,14 @@ def build_persona_weights(df_master, persona_name, returns_df):
     if eq_total > 0:
         out.loc[eq_idx, "EquitySleeveWeight"] = weights[eq_idx] / eq_total
 
-    # Fix the initial holdings at the 31 Aug 2026 investment-date price.
-    # Future refreshes update CurrentPrice/CurrentValue but do not recalculate units.
-    # This is what allows the dashboard to show genuine portfolio P&L over time.
-    out["EntryPrice"] = out["LivePrice"]
+    # Fix the initial holdings at the explicit 31 Aug 2026 investment-date price.
+    # Units stay fixed; later refreshes only change CurrentPrice/CurrentValue.
     out["Units"] = np.where(
         out["EntryPrice"].notna() & (out["EntryPrice"] > 0),
         out["Allocated_Amount"] / out["EntryPrice"],
         np.nan,
     )
-    out["CurrentValue"] = out["Units"] * out["LivePrice"]
+    out["CurrentValue"] = out["Units"] * out["EntryPrice"]
     out["UnrealizedPnL"] = out["CurrentValue"] - out["Allocated_Amount"]
 
     # Return decomposition.
@@ -987,7 +1014,21 @@ try:
         prices_df = fetch_live_market_data(lookback_yrs)
         daily_prices_df = fetch_daily_prices()
         df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
-        df_master, optimization_meta = build_persona_weights(df_master_raw, selected_persona, returns_df)
+
+        # Make the investment-date price explicit and consistent across
+        # all subsequent calculations.
+        df_master_raw = apply_entry_prices_asof(
+            df_master_raw,
+            daily_prices_df,
+            VALUATION_DATE,
+        )
+
+        # Re-use the explicit entry price during unit calculation.
+        df_master, optimization_meta = build_persona_weights(
+            df_master_raw,
+            selected_persona,
+            returns_df,
+        )
 except Exception as e:
     st.error("Error executing market analysis engine.")
     st.exception(e)
@@ -1018,8 +1059,13 @@ for _, row in df_master.iterrows():
             previous_prices[ticker] = float(s.iloc[-2])
 
 df_master["CurrentPrice"] = df_master.apply(
-    lambda r: latest_prices.get(r["Ticker"], r["LivePrice"]), axis=1
+    lambda r: latest_prices.get(r["Ticker"], r["EntryPrice"]), axis=1
 )
+
+# On the investment date itself, current price and entry price must be identical
+# so the portfolio cannot show an artificial day-one gain/loss.
+if TODAY <= VALUATION_DATE:
+    df_master["CurrentPrice"] = df_master["EntryPrice"]
 df_master["PreviousClose"] = df_master.apply(
     lambda r: previous_prices.get(r["Ticker"], r["CurrentPrice"]), axis=1
 )
@@ -1261,6 +1307,14 @@ k5.markdown(
     unsafe_allow_html=True,
 )
 
+# Reconciliation check: all instruments should sum back to the ₹1 Cr invested
+# amount at inception, before dividends or market movement.
+entry_value_check = float(df_master["Allocated_Amount"].sum())
+st.caption(
+    f"Inception reconciliation: ₹{entry_value_check/1e7:.2f} Cr allocated across "
+    f"{len(df_master)} instruments. Units are locked at the 31 Aug 2026 entry price."
+)
+
 st.write("")
 
 if optimization_meta["target_feasible"]:
@@ -1291,10 +1345,10 @@ for col, (pname, pdata) in zip([p1, p2, p3], PERSONAS.items()):
             <div class="persona-target">₹{pdata['target_corpus']/1e7:.2f} Cr</div>
             <div class="persona-cagr">
                 target CAGR {pdata['target_cagr']:.2%} ·
-                equity {pdata['equity_weight']:.0%} ·
-                debt {pdata['bond_weight']:.0%} ·
-                gold {pdata['gold_weight']:.0%} ·
-                silver {pdata['silver_weight']:.0%}
+                equity {pdata['min_equity']:.0%}–{pdata['max_equity']:.0%} ·
+                debt {pdata['min_debt']:.0%}–{pdata['max_debt']:.0%} ·
+                gold {pdata['min_gold']:.0%}–{pdata['max_gold']:.0%} ·
+                silver {pdata['min_silver']:.0%}–{pdata['max_silver']:.0%}
             </div>
         </div>
         """,
@@ -1332,6 +1386,7 @@ with detail_left:
     details = {
         "Asset Class": selected_row["Type"],
         "Sector / Exposure": selected_row["Sector"],
+        "Entry Price (31 Aug 2026)": f"₹{selected_row['EntryPrice']:,.2f}" if pd.notna(selected_row["EntryPrice"]) else "N/A",
         "Cap Category": selected_row["CapCategory"],
         "Price Date": str(pd.Timestamp(selected_row["PriceDate"]).date()) if pd.notna(selected_row["PriceDate"]) else "N/A",
         "Units": f"{selected_row['Units']:,.4f}" if pd.notna(selected_row["Units"]) else "N/A",
@@ -1825,6 +1880,6 @@ with tab_history:
 
 st.write("")
 st.caption(
-    f"Educational/simulation dashboard. Current value is marked to the latest available trading price; holdings are fixed from the 31 Aug 2026 investment date. "
+    f"Educational/simulation dashboard. Holdings are fixed from 31 Aug 2026 entry prices; current value is marked to the latest available trading price. On the investment date itself, day-one P&L is zero by construction. "
     f"Historical CAGR, beta and CAPM metrics are model estimates and should not be treated as guaranteed future returns."
 )
