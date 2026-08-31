@@ -1,3 +1,4 @@
+%%writefile app.py
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -35,7 +36,7 @@ universe = pd.DataFrame([
     dict(Ticker="NATIONALUM.NS", Name="National Aluminium Company",      AssetClass="Equity", Sector="Metals",                      MarketCapCr=73970.35,  PE=10.28, EPS=36.78),
     dict(Ticker="FORCEMOT.NS",   Name="Force Motors",                    AssetClass="Equity", Sector="Automobiles",                 MarketCapCr=23207.35,  PE=21.25, EPS=824.82),
     dict(Ticker="LLOYDSME.NS",   Name="Lloyds Metals & Energy",          AssetClass="Equity", Sector="Metals",                      MarketCapCr=103102.04, PE=24.63, EPS=72.60),
-    dict(Ticker="APARINDS.NS",   Name="Apar Industries",                 AssetCapCr=69947.11,  PE=61.89, EPS=284.94),
+    dict(Ticker="APARINDS.NS",   Name="Apar Industries",                 AssetClass="Equity", Sector="Electrical / Industrial",     MarketCapCr=69947.11,  PE=61.89, EPS=284.94),
     dict(Ticker="OIL.NS",        Name="Oil India",                       AssetClass="Equity", Sector="Oil & Gas",                   MarketCapCr=77150.01,  PE=12.12, EPS=40.03),
     dict(Ticker="TVSMOTOR.NS",   Name="TVS Motor Company",               AssetClass="Equity", Sector="Automobiles",                 MarketCapCr=207420.66, PE=50.75, EPS=85.17),
     dict(Ticker=None,            Name="6.03% GOI G-Sec 2029",            AssetClass="Bond",   Sector="Sovereign",                   MarketCapCr=None, PE=None, EPS=None),
