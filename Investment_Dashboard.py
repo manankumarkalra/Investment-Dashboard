@@ -796,6 +796,15 @@ def analyze_live_performance(prices_df, rf_rate, mkt_return):
 
         div_yield = fetch_dividend_yield(t) if item["Type"] == "Equity" else 0.0
 
+        market_cap_cr = np.nan
+        try:
+            info = yf.Ticker(t).info or {}
+            raw_mc = info.get("marketCap")
+            if raw_mc is not None:
+                market_cap_cr = float(raw_mc) / 1e7  # ₹ crore
+        except Exception:
+            market_cap_cr = np.nan
+
         if item["Type"] == "Equity":
             capm_return = rf_rate + beta * (mkt_return - rf_rate)
             total_expected = capm_return + div_yield
@@ -816,6 +825,7 @@ def analyze_live_performance(prices_df, rf_rate, mkt_return):
             "DivYield": div_yield,
             "CAPM_Return": capm_return,
             "Total_Expected_Return": total_expected,
+            "MarketCapCr": market_cap_cr,
         })
         records.append(rec)
 
@@ -1516,6 +1526,10 @@ detail_left, detail_right = st.columns([1, 1.4])
 with detail_left:
     details = {
         "Asset Class": selected_row["Type"],
+        "Market Cap": (
+            f"₹{selected_row['MarketCapCr']:,.0f} Cr"
+            if pd.notna(selected_row["MarketCapCr"]) else "N/A"
+        ),
         "Sector / Exposure": selected_row["Sector"],
         "Entry Price (31 Aug 2026)": f"₹{selected_row['EntryPrice']:,.2f}" if pd.notna(selected_row["EntryPrice"]) else "N/A",
         "Cap Category": selected_row["CapCategory"],
@@ -1786,8 +1800,10 @@ with tab_holdings:
     # so the table shows correct portfolio percentages.
     display_df["Portfolio Weight %"] = display_df["Portfolio_Weight"] * 100.0
 
+    display_df["Market Cap (₹ Cr)"] = display_df["MarketCapCr"]
+
     cols = [
-        "Name", "Type", "Sector", "CapCategory", "Current Price", "Price Date",
+        "Name", "Market Cap (₹ Cr)", "Type", "Sector", "CapCategory", "Current Price",
         "Units", "Portfolio Weight %", "Allocated_Amount", "CurrentValue",
         "Dividend Earned", "Total Gain", "Daily Change %", "Historical CAGR",
         "Capital Gain", "Dividend / Interest", "Expected Total Return", "Beta",
@@ -1814,6 +1830,9 @@ with tab_holdings:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Market Cap (₹ Cr)": st.column_config.NumberColumn(
+                "Market Cap (₹ Cr)", format="₹%,.0f"
+            ),
             "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
             "Price Date": st.column_config.DateColumn(format="DD MMM YYYY"),
             "Units": st.column_config.NumberColumn(format="%.4f"),
