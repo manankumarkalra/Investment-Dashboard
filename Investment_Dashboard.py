@@ -1393,10 +1393,10 @@ with proj_r:
     st.markdown(
         f"""
         <div class="hero-wrap" style="margin-top:6px;">
-            <div class="hero-eyebrow">VALUE ADDED FROM TODAY</div>
+            <div class="hero-eyebrow">PROJECTED GAIN BY TARGET DATE</div>
             <div class="hero-big-number">₹{live_projected_gain/1e5:.2f} L</div>
             <div class="hero-big-label">
-                Implied gain of {live_projected_gain_pct:.2%} from today's
+                Projected gain of {live_projected_gain_pct:.2%} from today's
                 ₹{current_portfolio_value/1e7:.2f} Cr over the remaining horizon.
             </div>
         </div>
