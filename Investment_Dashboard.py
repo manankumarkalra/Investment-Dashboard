@@ -1096,10 +1096,29 @@ if not div_hist.empty:
     div_hist["Cash Dividend"] = div_hist["Dividend / Share"] * div_hist["Units"]
 else:
     div_hist = pd.DataFrame(
-        columns=["Company", "Symbol", "Dividend / Share", "Ex-Date",
-                 "NSE Announcement Date", "Record Date", "Source",
-                 "Ticker", "Units", "Cash Dividend"]
+        columns=[
+            "Company", "Symbol", "Dividend / Share", "Ex-Date",
+            "NSE Announcement Date", "Record Date",
+            "NSE Announcement Subject", "Source",
+            "Ticker", "Units", "Cash Dividend"
+        ]
     )
+
+# Guarantee the dividend-event schema even when a data provider returns
+# zero events or only a partial response. This prevents pandas KeyError.
+_dividend_required_schema = [
+    "Company", "Symbol", "Dividend / Share", "Ex-Date",
+    "NSE Announcement Date", "Record Date", "NSE Announcement Subject",
+    "Source", "Ticker", "Units", "Cash Dividend"
+]
+for _col in _dividend_required_schema:
+    if _col not in div_hist.columns:
+        if "Date" in _col or _col in {"Ex-Date", "Record Date"}:
+            div_hist[_col] = pd.NaT
+        elif _col in {"Dividend / Share", "Units", "Cash Dividend"}:
+            div_hist[_col] = np.nan
+        else:
+            div_hist[_col] = ""
 
 # NSE cross-check for declaration/broadcast information.
 try:
@@ -1128,7 +1147,7 @@ if not nse_div.empty:
                 candidates["date_diff"] = (
                     pd.to_datetime(candidates["NSE Ex-Date"], errors="coerce")
                     - pd.Timestamp(ex_date)
-                ).abs().dt.days
+                ).abs().dt.dayss
                 candidates = candidates.sort_values("date_diff")
 
             best = candidates.iloc[0]
@@ -1568,14 +1587,23 @@ with tab_overview:
         '<div class="section-note">Dividend events affecting the portfolio since the 31 Aug 2026 investment date. Ex-date is the corporate-action date used for dividend entitlement. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
         unsafe_allow_html=True,
     )
-    if not div_hist.empty:
-        dividend_view = div_hist[[
-            "Company", "Dividend / Share", "NSE Announcement Date",
-            "NSE Announcement Subject", "Ex-Date", "Record Date",
-            "Cash Dividend", "Source"
-        ]].copy()
+    required_display_cols = [
+        "Company", "Dividend / Share", "NSE Announcement Date",
+        "NSE Announcement Subject", "Ex-Date", "Record Date",
+        "Cash Dividend", "Source"
+    ]
+    dividend_view = div_hist.reindex(columns=required_display_cols).copy()
+
+    if not dividend_view.empty:
+        for _date_col in ["NSE Announcement Date", "Ex-Date", "Record Date"]:
+            dividend_view[_date_col] = pd.to_datetime(
+                dividend_view[_date_col], errors="coerce"
+            )
+
         st.dataframe(
-            dividend_view.sort_values("Ex-Date", ascending=False),
+            dividend_view.sort_values(
+                "Ex-Date", ascending=False, na_position="last"
+            ),
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -1589,7 +1617,10 @@ with tab_overview:
             },
         )
     else:
-        st.info("No dividend event has been recorded since the 31 Aug 2026 investment date.")
+        st.info(
+            "No dividend event has been recorded since the 31 Aug 2026 investment date. "
+            "The tracker will check again on the next daily refresh."
+        )
 
 # ---------- TAB 2: HOLDINGS ----------
 with tab_holdings:
