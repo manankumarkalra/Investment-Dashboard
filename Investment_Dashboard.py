@@ -1641,12 +1641,33 @@ with tab_holdings:
     display_df["Capital Gain"] = display_df["CapitalGainExpected"]
     display_df["Expected Total Return"] = display_df["Total_Expected_Return"]
 
+    # Streamlit's printf-style percent formatting displays the raw number.
+    # Convert decimal weights to percentage points explicitly (0.125 -> 12.5)
+    # so the table shows correct portfolio percentages.
+    display_df["Portfolio Weight %"] = display_df["Portfolio_Weight"] * 100.0
+
     cols = [
         "Name", "Type", "Sector", "CapCategory", "Current Price", "Price Date",
-        "Units", "Portfolio_Weight", "Allocated_Amount", "CurrentValue",
+        "Units", "Portfolio Weight %", "Allocated_Amount", "CurrentValue",
         "Dividend Cash", "Total Gain", "Daily Change %", "Historical CAGR",
         "Capital Gain", "Dividend / Interest", "Expected Total Return", "Beta",
     ]
+
+    # Explicit reconciliation: raw weights must add to exactly 100% (within
+    # floating-point tolerance), and asset-class totals should match the
+    # optimizer output.
+    total_weight = float(df_master["Portfolio_Weight"].sum())
+    asset_weights = df_master.groupby("Type")["Portfolio_Weight"].sum().to_dict()
+
+    rw1, rw2, rw3, rw4, rw5 = st.columns(5)
+    rw1.metric("Total Weight", f"{total_weight:.2%}")
+    rw2.metric("Equity", f"{asset_weights.get('Equity', 0.0):.2%}")
+    rw3.metric("Debt", f"{asset_weights.get('Bond', 0.0):.2%}")
+    rw4.metric("Gold", f"{asset_weights.get('Gold ETF', 0.0):.2%}")
+    rw5.metric("Silver", f"{asset_weights.get('Silver ETF', 0.0):.2%}")
+
+    if abs(total_weight - 1.0) > 1e-8:
+        st.error("Portfolio weights do not reconcile to 100%. Please refresh the model.")
 
     st.dataframe(
         display_df[cols],
@@ -1656,11 +1677,11 @@ with tab_holdings:
             "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
             "Price Date": st.column_config.DateColumn(format="DD MMM YYYY"),
             "Units": st.column_config.NumberColumn(format="%.4f"),
-            "Portfolio_Weight": st.column_config.ProgressColumn(
+            "Portfolio Weight %": st.column_config.ProgressColumn(
                 "Portfolio Weight",
                 format="%.1f%%",
                 min_value=0,
-                max_value=max(float(display_df["Portfolio_Weight"].max()) * 1.15, 0.1),
+                max_value=max(float(display_df["Portfolio Weight %"].max()) * 1.15, 10.0),
             ),
             "Allocated_Amount": st.column_config.NumberColumn("Invested", format="₹%d"),
             "CurrentValue": st.column_config.NumberColumn("Current Value", format="₹%d"),
@@ -1697,7 +1718,7 @@ with tab_holdings:
         )
         fig_bar.update_layout(
             height=480,
-            xaxis_tickformat=".0%",
+            xaxis_tickformat=".1%",
             yaxis_title="",
             xaxis_title="Portfolio weight",
             legend_title="",
