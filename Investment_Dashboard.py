@@ -1107,18 +1107,6 @@ try:
     with st.spinner("Downloading market data & computing risk/return metrics..."):
         prices_df = fetch_live_market_data(lookback_yrs)
         daily_prices_df = fetch_daily_prices()
-
-        # Use the latest date actually present in the downloaded market data
-        # for the portfolio valuation label, rather than hardcoding the
-        # original investment date. Fall back to today's date only if the
-        # feed returns no dated prices.
-        available_market_dates = daily_prices_df.dropna(how="all").index
-        latest_market_date = (
-            pd.Timestamp(available_market_dates.max()).normalize()
-            if len(available_market_dates)
-            else TODAY
-        )
-
         df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
 
         # Make the investment-date price explicit and consistent across
@@ -1357,7 +1345,7 @@ with hero_r:
         f"""
         <div class="hero-wrap" style="text-align:right; height:100%;">
             <div class="hero-big-number">₹{current_portfolio_value/1e7:.2f} Cr</div>
-            <div class="hero-big-label">Current portfolio value at {latest_market_date.strftime("%d %b %Y")}</div>
+            <div class="hero-big-label">Current portfolio value at {pd.Timestamp(daily_prices_df.index.max()).strftime("%d %b %Y")}</div>
             <div class="{"kpi-delta-pos" if current_pnl >= 0 else "kpi-delta-neg"}"
                  style="margin-top:10px; font-size:13px;">
                 Day-0 P&L: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
