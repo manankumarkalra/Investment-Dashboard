@@ -350,16 +350,9 @@ def fetch_live_market_data(lookback_yrs=5):
     # Nifty 50 is the benchmark used by the current CAPM implementation.
     tickers.append("^NSEI")
 
-    # Use a fixed historical window ending on the investment date.
-    # This keeps the optimizer's inputs anchored to 31 Aug 2026 instead of
-    # allowing the rolling Yahoo Finance `period` window to drift every day.
-    history_end = VALUATION_DATE + pd.Timedelta(days=1)  # yfinance end is exclusive
-    history_start = VALUATION_DATE - pd.DateOffset(years=max(int(lookback_yrs), 1))
-
     raw = yf.download(
         tickers,
-        start=history_start.strftime("%Y-%m-%d"),
-        end=history_end.strftime("%Y-%m-%d"),
+        period=f"{max(lookback_yrs, 1)}y",
         interval="1wk",
         auto_adjust=True,
         progress=False,
@@ -430,9 +423,18 @@ def compute_beta(asset_returns, benchmark_returns):
     return float(np.cov(combined.iloc[:, 0], combined.iloc[:, 1], ddof=1)[0, 1] / mkt_var)
 
 
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def fetch_yahoo_info(ticker):
+    """Cache Yahoo metadata to reduce repeated .info requests per rerun."""
+    try:
+        return yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+
+
 def fetch_dividend_yield(ticker):
     try:
-        info = yf.Ticker(ticker).info or {}
+        info = fetch_yahoo_info(ticker)
         div = info.get("dividendYield")
         if div is None:
             return 0.0
@@ -805,7 +807,7 @@ def analyze_live_performance(prices_df, rf_rate, mkt_return):
 
         market_cap_cr = np.nan
         try:
-            info = yf.Ticker(t).info or {}
+            info = fetch_yahoo_info(t)
             raw_mc = info.get("marketCap")
             if raw_mc is not None:
                 market_cap_cr = float(raw_mc) / 1e7  # ₹ crore
@@ -1114,6 +1116,12 @@ try:
     with st.spinner("Downloading market data & computing risk/return metrics..."):
         prices_df = fetch_live_market_data(lookback_yrs)
         daily_prices_df = fetch_daily_prices()
+        # The portfolio's displayed valuation date is the latest actual daily
+        # market-data date, not the server's calendar date.
+        MARKET_AS_OF_DATE = (
+            pd.Timestamp(daily_prices_df.index.max()).normalize()
+            if not daily_prices_df.empty else pd.NaT
+        )
         df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
 
         # Make the investment-date price explicit and consistent across
@@ -1165,8 +1173,19 @@ for _, row in df_master.iterrows():
             previous_prices[ticker] = float(s.iloc[-2])
 
 df_master["CurrentPrice"] = df_master.apply(
-    lambda r: latest_prices.get(r["Ticker"], r["EntryPrice"]), axis=1
+    lambda r: latest_prices.get(r["Ticker"], np.nan), axis=1
 )
+missing_current_prices = df_master.loc[
+    df_master["CurrentPrice"].isna(), "Name"
+].astype(str).tolist()
+if missing_current_prices:
+    st.warning(
+        "Latest daily market prices are unavailable for: "
+        + ", ".join(missing_current_prices)
+        + ". Their current values are shown as unavailable rather than being"
+          " incorrectly replaced with their 31 Aug 2026 entry prices. Refresh"
+          " market data before relying on the portfolio total."
+    )
 
 # On the investment date itself, current price and entry price must be identical
 # so the portfolio cannot show an artificial day-one gain/loss.
@@ -1235,7 +1254,8 @@ current_pnl_pct = current_pnl / invested_capital if invested_capital else 0.0
 # The target corpus remains fixed. Market movements change the portfolio's
 # current value, so the CAGR required from TODAY to the target date changes.
 target_date = VALUATION_DATE + pd.DateOffset(years=HORIZON_YEARS)
-remaining_days = max((target_date.normalize() - TODAY).days, 0)
+horizon_as_of_date = MARKET_AS_OF_DATE if pd.notna(MARKET_AS_OF_DATE) else TODAY
+remaining_days = max((target_date.normalize() - horizon_as_of_date).days, 0)
 remaining_years = remaining_days / 365.25
 
 portfolio_expected_return = optimization_meta["achieved_expected_return"]
@@ -1335,7 +1355,7 @@ with hero_l:
     st.markdown(
         f"""
         <div class="hero-wrap">
-            <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {TODAY.strftime("%d %b %Y")} · INVESTED 31 AUG 2026 · {lookback_yrs}Y LOOKBACK</div>
+            <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {(MARKET_AS_OF_DATE.strftime("%d %b %Y") if pd.notna(MARKET_AS_OF_DATE) else "MARKET DATA UNAVAILABLE")} · INVESTED 31 AUG 2026 · {lookback_yrs}Y LOOKBACK</div>
             <div class="hero-title">15-Asset Allocation Terminal</div>
             <p class="hero-sub">
                 ₹1.00 Cr allocated across 11 equities, 2 bonds, Gold ETF and Silver ETF for the
@@ -1347,21 +1367,15 @@ with hero_l:
         unsafe_allow_html=True,
     )
 
-latest_valuation_date = (
-    pd.Timestamp(daily_prices_df.index.max()).strftime("%d %b %Y")
-    if not daily_prices_df.empty
-    else TODAY.strftime("%d %b %Y")
-)
-
 with hero_r:
     st.markdown(
         f"""
         <div class="hero-wrap" style="text-align:right; height:100%;">
             <div class="hero-big-number">₹{current_portfolio_value/1e7:.2f} Cr</div>
-            <div class="hero-big-label">Current portfolio value at {latest_valuation_date}</div>
+            <div class="hero-big-label">Current portfolio value at {(MARKET_AS_OF_DATE.strftime("%d %b %Y") if pd.notna(MARKET_AS_OF_DATE) else "market data unavailable")}</div>
             <div class="{"kpi-delta-pos" if current_pnl >= 0 else "kpi-delta-neg"}"
                  style="margin-top:10px; font-size:13px;">
-                Day-0 P&L: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
+                P&L since 31 Aug 2026: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
             </div>
         </div>
         """,
@@ -1452,8 +1466,8 @@ with proj_r:
 # amount at inception, before dividends or market movement.
 entry_value_check = float(df_master["Allocated_Amount"].sum())
 st.caption(
-    f"Inception reconciliation: ₹{entry_value_check/1e7:.2f} Cr allocated across "
-    f"{len(df_master)} instruments. Units are locked at the 31 Aug 2026 entry price."
+    f"Initial allocation total (not a unit-price reconciliation): ₹{entry_value_check/1e7:.2f} Cr allocated across "
+    f"{len(df_master)} instruments. Entry prices are sourced as of 31 Aug 2026 where data is available."
 )
 
 st.write("")
@@ -1740,7 +1754,8 @@ with tab_overview:
     daily_move = daily_move[
         ["Name", "Market Cap (₹ Cr)", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]
     ]
-    daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False)
+    daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False).copy()
+    daily_move["DailyPriceChangePct"] = daily_move["DailyPriceChangePct"] * 100.0
 
     st.dataframe(
         daily_move,
@@ -1824,13 +1839,13 @@ with tab_holdings:
     display_df = df_master.copy()
     display_df["Current Price"] = display_df["CurrentPrice"]
     display_df["Price Date"] = display_df["PriceDate"]
-    display_df["Daily Change %"] = display_df["DailyPriceChangePct"]
+    display_df["Daily Change %"] = display_df["DailyPriceChangePct"] * 100.0
+    display_df["Historical CAGR"] = pd.to_numeric(display_df["Actual_CAGR"], errors="coerce") * 100.0
     display_df["Dividend Earned"] = display_df["DividendEntitlement"]
     display_df["Total Gain"] = display_df["TotalInvestmentGain"]
-    display_df["Historical CAGR"] = display_df["Actual_CAGR"]
-    display_df["Dividend / Interest"] = display_df["ExpectedIncomeYield"]
-    display_df["Capital Gain"] = display_df["CapitalGainExpected"]
-    display_df["Expected Total Return"] = display_df["Total_Expected_Return"]
+    display_df["Dividend / Interest"] = pd.to_numeric(display_df["ExpectedIncomeYield"], errors="coerce") * 100.0
+    display_df["Capital Gain"] = pd.to_numeric(display_df["CapitalGainExpected"], errors="coerce") * 100.0
+    display_df["Expected Total Return"] = pd.to_numeric(display_df["Total_Expected_Return"], errors="coerce") * 100.0
 
     # Streamlit's printf-style percent formatting displays the raw number.
     # Convert decimal weights to percentage points explicitly (0.125 -> 12.5)
