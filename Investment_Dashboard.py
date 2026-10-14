@@ -350,9 +350,16 @@ def fetch_live_market_data(lookback_yrs=5):
     # Nifty 50 is the benchmark used by the current CAPM implementation.
     tickers.append("^NSEI")
 
+    # Use a fixed historical window ending on the investment date.
+    # This keeps the optimizer's inputs anchored to 31 Aug 2026 instead of
+    # allowing the rolling Yahoo Finance `period` window to drift every day.
+    history_end = VALUATION_DATE + pd.Timedelta(days=1)  # yfinance end is exclusive
+    history_start = VALUATION_DATE - pd.DateOffset(years=max(int(lookback_yrs), 1))
+
     raw = yf.download(
         tickers,
-        period=f"{max(lookback_yrs, 1)}y",
+        start=history_start.strftime("%Y-%m-%d"),
+        end=history_end.strftime("%Y-%m-%d"),
         interval="1wk",
         auto_adjust=True,
         progress=False,
@@ -1340,12 +1347,18 @@ with hero_l:
         unsafe_allow_html=True,
     )
 
+latest_valuation_date = (
+    pd.Timestamp(daily_prices_df.index.max()).strftime("%d %b %Y")
+    if not daily_prices_df.empty
+    else TODAY.strftime("%d %b %Y")
+)
+
 with hero_r:
     st.markdown(
         f"""
         <div class="hero-wrap" style="text-align:right; height:100%;">
             <div class="hero-big-number">₹{current_portfolio_value/1e7:.2f} Cr</div>
-            <div class="hero-big-label">Current portfolio value at {pd.Timestamp(daily_prices_df.index.max()).strftime("%d %b %Y")}</div>
+            <div class="hero-big-label">Current portfolio value at {latest_valuation_date}</div>
             <div class="{"kpi-delta-pos" if current_pnl >= 0 else "kpi-delta-neg"}"
                  style="margin-top:10px; font-size:13px;">
                 Day-0 P&L: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
