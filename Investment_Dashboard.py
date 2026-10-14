@@ -1107,6 +1107,18 @@ try:
     with st.spinner("Downloading market data & computing risk/return metrics..."):
         prices_df = fetch_live_market_data(lookback_yrs)
         daily_prices_df = fetch_daily_prices()
+
+        # Use the latest date actually present in the downloaded market data
+        # for the portfolio valuation label, rather than hardcoding the
+        # original investment date. Fall back to today's date only if the
+        # feed returns no dated prices.
+        available_market_dates = daily_prices_df.dropna(how="all").index
+        latest_market_date = (
+            pd.Timestamp(available_market_dates.max()).normalize()
+            if len(available_market_dates)
+            else TODAY
+        )
+
         df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
 
         # Make the investment-date price explicit and consistent across
@@ -1118,6 +1130,11 @@ try:
         )
 
         # Re-use the explicit entry price during unit calculation.
+        # Guarantee a MarketCapCr field so the Daily Market Movement table
+        # never breaks when an instrument does not have a meaningful market cap.
+        if "MarketCapCr" not in df_master_raw.columns:
+            df_master_raw["MarketCapCr"] = np.nan
+
         df_master, optimization_meta = build_persona_weights(
             df_master_raw,
             selected_persona,
@@ -1340,7 +1357,7 @@ with hero_r:
         f"""
         <div class="hero-wrap" style="text-align:right; height:100%;">
             <div class="hero-big-number">₹{current_portfolio_value/1e7:.2f} Cr</div>
-            <div class="hero-big-label">Current portfolio value at 31 Aug 2026</div>
+            <div class="hero-big-label">Current portfolio value at {latest_market_date.strftime("%d %b %Y")}</div>
             <div class="{"kpi-delta-pos" if current_pnl >= 0 else "kpi-delta-neg"}"
                  style="margin-top:10px; font-size:13px;">
                 Day-0 P&L: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
@@ -1712,16 +1729,35 @@ with tab_overview:
     )
 
     st.markdown('<div class="section-title">Daily Market Movement</div>', unsafe_allow_html=True)
-    daily_move = df_master[["Name", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]].copy()
+
+    daily_move = df_master[
+        ["Name", "MarketCapCr", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]
+    ].copy()
+
+    # Show Market Cap immediately after the investment name.
+    daily_move["Market Cap (₹ Cr)"] = daily_move["MarketCapCr"]
+    daily_move = daily_move[
+        ["Name", "Market Cap (₹ Cr)", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]
+    ]
     daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False)
+
     st.dataframe(
         daily_move,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "CurrentPrice": st.column_config.NumberColumn("Current Price", format="₹%.2f"),
-            "DailyPriceChange": st.column_config.NumberColumn("₹ Change", format="₹%.2f"),
-            "DailyPriceChangePct": st.column_config.NumberColumn("Daily Change", format="%.2f%%"),
+            "Market Cap (₹ Cr)": st.column_config.NumberColumn(
+                "Market Cap (₹ Cr)", format="₹%,.0f"
+            ),
+            "CurrentPrice": st.column_config.NumberColumn(
+                "Current Price", format="₹%.2f"
+            ),
+            "DailyPriceChange": st.column_config.NumberColumn(
+                "₹ Change", format="₹%.2f"
+            ),
+            "DailyPriceChangePct": st.column_config.NumberColumn(
+                "Daily Change", format="%.2f%%"
+            ),
         },
     )
 
