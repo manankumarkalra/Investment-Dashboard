@@ -282,11 +282,10 @@ assert TARGET_DATE == INVESTMENT_DATE + pd.DateOffset(years=HORIZON_YEARS), (
     "TARGET_DATE must equal INVESTMENT_DATE + HORIZON_YEARS"
 )
 
-# The ORIGINAL ₹1 Cr portfolio is established once, as of INVESTMENT_DATE, using
-# these inception settings, and is then frozen in a snapshot file.
-# Sidebar inputs (persona / lookback / Rf / Rm) only drive the CURRENT
-# recommendation and modelled returns - never the original holdings.
-INCEPTION_PERSONA = "Moderate"
+# Each persona gets its own simulated ₹1 Cr portfolio at INVESTMENT_DATE.
+# Its security units are frozen in a persona-specific snapshot so that switching
+# profiles changes the selected portfolio valuation without rewriting history.
+INCEPTION_PERSONA = "Moderate"  # legacy/default snapshot name
 INCEPTION_LOOKBACK_YRS = 5
 INCEPTION_RF = DEFAULT_RF
 INCEPTION_RM = DEFAULT_RM
@@ -364,6 +363,19 @@ for p_name, p_data in PERSONAS.items():
         asset_class: value / midpoint_total
         for asset_class, value in midpoints.items()
     }
+
+# One frozen inception snapshot per persona. The existing inception_holdings.json
+# remains the Moderate snapshot for backwards compatibility.
+PERSONA_SNAPSHOT_PATHS = {
+    "Aggressive": os.path.join(APP_DIR, "inception_holdings_aggressive.json"),
+    "Moderate": SNAPSHOT_PATH,
+    "Conservative": os.path.join(APP_DIR, "inception_holdings_conservative.json"),
+}
+PERSONA_AUTOSAVE_PATHS = {
+    "Aggressive": os.path.join(APP_DIR, ".inception_holdings_aggressive_autosave.json"),
+    "Moderate": AUTOSAVE_PATH,
+    "Conservative": os.path.join(APP_DIR, ".inception_holdings_conservative_autosave.json"),
+}
 
 # ============================================================
 # LOCKED 15-INSTRUMENT UNIVERSE
@@ -910,11 +922,10 @@ def validate_snapshot(snap):
     return problems
 
 
-def create_inception_snapshot(close_df, adj_df, div_map):
+def create_inception_snapshot(close_df, adj_df, div_map, persona_name=INCEPTION_PERSONA):
     """
-    Establish the original portfolio from data dated on/before INVESTMENT_DATE.
-    Returns (snapshot_dict, []) or (None, [problems]). Nothing is created unless
-    EVERY instrument has a verified entry price and a complete analysis.
+    Establish one persona-specific ₹1 Cr portfolio using data dated on/before
+    INVESTMENT_DATE. Returns (snapshot_dict, []) or (None, [problems]).
     """
     problems = []
     entry_df = select_entry_prices(close_df, INVESTMENT_DATE, ALL_TICKERS)
@@ -936,9 +947,9 @@ def create_inception_snapshot(close_df, adj_df, div_map):
         return None, problems
 
     try:
-        reco, meta = build_persona_weights(df_an, INCEPTION_PERSONA, wk)
+        reco, meta = build_persona_weights(df_an, persona_name, wk)
     except Exception as exc:
-        return None, [f"Optimizer failed while establishing the original portfolio: {exc}"]
+        return None, [f"Optimizer failed while establishing the {persona_name} inception portfolio: {exc}"]
 
     merged = entry_df.merge(
         reco[["Ticker", "Portfolio_Weight", "Allocated_Amount"]], on="Ticker", how="left"
@@ -966,7 +977,7 @@ def create_inception_snapshot(close_df, adj_df, div_map):
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "investment_date": INVESTMENT_DATE.date().isoformat(),
         "corpus": CORPUS,
-        "persona": INCEPTION_PERSONA,
+        "persona": persona_name,
         "lookback_yrs": INCEPTION_LOOKBACK_YRS,
         "rf_rate": INCEPTION_RF,
         "mkt_return": INCEPTION_RM,
@@ -990,21 +1001,23 @@ def snapshot_to_df(snap):
     )
 
 
-def load_inception_snapshot():
-    """
-    Returns (snapshot | None, kind, problems).
-      kind 'repo'     - inception_holdings.json committed next to this file (permanent)
-      kind 'autosave' - best-effort local copy (lost when the Streamlit container restarts)
-    An existing-but-invalid file is reported, never silently replaced.
-    """
-    for path, kind in ((SNAPSHOT_PATH, "repo"), (AUTOSAVE_PATH, "autosave")):
+def load_inception_snapshot(persona_name=INCEPTION_PERSONA):
+    """Load the frozen inception snapshot for one persona, if available."""
+    repo_path = PERSONA_SNAPSHOT_PATHS[persona_name]
+    autosave_path = PERSONA_AUTOSAVE_PATHS[persona_name]
+    for path, kind in ((repo_path, "repo"), (autosave_path, "autosave")):
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     snap = json.load(fh)
             except Exception as exc:
                 return None, kind, [f"Could not read {os.path.basename(path)}: {exc}"]
-            return snap, kind, validate_snapshot(snap)
+            problems = validate_snapshot(snap)
+            if not problems and snap.get("persona", persona_name) != persona_name:
+                problems.append(
+                    f"Snapshot persona {snap.get('persona')!r} does not match requested {persona_name!r}."
+                )
+            return snap, kind, problems
     return None, None, []
 
 
@@ -1363,14 +1376,14 @@ with st.sidebar:
             "Persona target",
             list(PERSONAS.keys()),
             index=1,
-            help="The target is the investor's desired 3-year outcome. It drives the target comparison and the CURRENT recommendation; it never changes the original 31 Aug 2026 holdings.",
+            help="Each persona has a separate ₹1 Cr inception portfolio with its own asset allocation. Selecting a persona updates the current value and P&L for that portfolio.",
         )
         lookback_yrs = st.slider(
             "Historical lookback (years)",
             min_value=1,
             max_value=5,
             value=5,
-            help="Used for the CURRENT beta/volatility/return analysis and recommendation. The original holdings were set with a fixed 5-year lookback ending 31 Aug 2026.",
+            help="Used for current risk/return analysis and recommendations. Inception allocations use a fixed 5-year lookback ending 31 Aug 2026.",
         )
 
     with st.expander("CAPM Parameters", expanded=True):
@@ -1400,24 +1413,36 @@ with st.sidebar:
     )
     st.caption("Investment date: 31 Aug 2026 · " + refresh_note)
     st.caption("Dividend source priority: NSE Corporate Actions → Yahoo fallback.")
-    st.caption("Original holdings are locked at inception. Persona, lookback, Rf and Rm only update the current recommendation and modelled returns.")
+    st.caption("Each persona has its own locked inception allocation. Lookback, Rf and Rm update current risk/return analysis and recommendations.")
 
 # ============================================================
 # 7. RUN DATA ENGINE
 # ============================================================
-# 7a. Load the locked inception snapshot (if one exists).
-snapshot, snapshot_kind, snapshot_problems = load_inception_snapshot()
-if snapshot_problems:
+# 7a. Load any saved inception snapshots. Each persona must have separate units
+# because each profile uses a different allocation of the same initial ₹1 Cr.
+persona_snapshots = {}
+persona_snapshot_kinds = {}
+persona_snapshot_problems = {}
+for _persona in PERSONAS:
+    _snap, _kind, _problems = load_inception_snapshot(_persona)
+    persona_snapshots[_persona] = _snap
+    persona_snapshot_kinds[_persona] = _kind
+    persona_snapshot_problems[_persona] = _problems
+
+_bad_snapshots = {
+    _persona: _problems
+    for _persona, _problems in persona_snapshot_problems.items()
+    if _problems
+}
+if _bad_snapshots:
     st.error(
-        "The inception snapshot file failed validation. The dashboard has stopped "
-        "instead of silently replacing your original holdings."
+        "An inception snapshot failed validation. The dashboard stopped rather than "
+        "silently replacing saved portfolio units."
     )
-    for _problem in snapshot_problems:
-        st.write("- " + _problem)
-    st.caption(
-        "Fix the file, or delete it deliberately if you really want the original "
-        "portfolio to be rebuilt from 31 Aug 2026 data."
-    )
+    for _persona, _problems in _bad_snapshots.items():
+        st.markdown(f"**{_persona}**")
+        for _problem in _problems:
+            st.write("- " + _problem)
     st.stop()
 
 # 7b. Market data.
@@ -1443,22 +1468,31 @@ if latest_market_date < INVESTMENT_DATE:
     )
     st.stop()
 
-# 7c. First run only: establish the original portfolio from data dated on or
-# before 31 Aug 2026. Nothing is created unless every instrument has a verified
-# entry price and complete analysis.
-if snapshot is None:
-    snapshot, _new_problems = create_inception_snapshot(close_df, adj_df, div_map)
-    if _new_problems:
-        st.error(
-            "The original 31 Aug 2026 portfolio could not be established safely, so nothing "
-            "was created. Fix the issue below (or press Refresh) and reload."
+# 7c. Create a separate frozen inception allocation for any persona without a
+# saved snapshot. The prices/analysis used for this step end at INVESTMENT_DATE.
+for _persona in PERSONAS:
+    if persona_snapshots[_persona] is None:
+        _snap, _problems = create_inception_snapshot(
+            close_df, adj_df, div_map, persona_name=_persona
         )
-        for _problem in _new_problems:
-            st.write("- " + _problem)
-        st.stop()
-    snapshot_kind = "autosave" if save_snapshot_file(snapshot, AUTOSAVE_PATH) else "provisional"
+        if _problems:
+            st.error(
+                f"The {_persona} portfolio could not be established safely from "
+                f"31 Aug 2026 data. No snapshot was created."
+            )
+            for _problem in _problems:
+                st.write("- " + _problem)
+            st.stop()
+        _saved = save_snapshot_file(_snap, PERSONA_AUTOSAVE_PATHS[_persona])
+        persona_snapshots[_persona] = _snap
+        persona_snapshot_kinds[_persona] = "autosave" if _saved else "provisional"
 
-# 7d. Current analysis + valuation of the ORIGINAL units.
+# The currently selected profile drives the main valuation panels.
+snapshot = persona_snapshots[selected_persona]
+snapshot_kind = persona_snapshot_kinds[selected_persona]
+snapshot_problems = []
+
+# 7d. Current analysis + valuation of the SELECTED PERSONA's frozen units.
 try:
     holdings_df = snapshot_to_df(snapshot)
     df_cur, returns_df = analyze_instruments(
@@ -1509,8 +1543,8 @@ persona_cfg = PERSONAS[selected_persona]
 target_cagr = persona_cfg["target_cagr"]
 
 # Calculate a separate current recommendation for EACH persona on the same current
-# market/risk inputs. Only the selected recommendation drives the selected-profile
-# KPI cards; the originals remain locked and are never overwritten.
+# market/risk inputs. These recommendations remain distinct from the three frozen
+# inception portfolios used for realized mark-to-market valuations.
 persona_recommendations = {}
 for _persona_name in PERSONAS:
     try:
@@ -1551,25 +1585,63 @@ except Exception as e:
     ])
 
 _counted = div_hist["Status"].eq(STATUS_ENTITLED)
-dividend_entitlement = float(
-    pd.to_numeric(div_hist.loc[_counted, "Dividend Entitlement"], errors="coerce").fillna(0).sum()
-)
 unparsed_dividends = int(
     pd.to_numeric(div_hist["Dividend / Share"], errors="coerce").isna().sum()
 )
 
-df_master["DividendEntitlement"] = 0.0
-if _counted.any():
-    dividend_by_ticker = div_hist.loc[_counted].groupby("Ticker")["Dividend Entitlement"].sum()
-    df_master["DividendEntitlement"] = (
-        df_master["Ticker"].map(dividend_by_ticker).fillna(0.0)
+# Value all three frozen persona portfolios from their own inception units.
+# Dividend events are fetched once; entitlement is recalculated per persona's units.
+persona_valuation_frames = {}
+persona_value_summary = {}
+for _pname, _psnap in persona_snapshots.items():
+    _p_holdings = snapshot_to_df(_psnap)
+    _p_df = _p_holdings.merge(
+        df_cur[_analysis_cols], on="Ticker", how="left", validate="one_to_one"
     )
+    _p_df["MarketCapCr"] = _p_df["Ticker"].map(market_caps)
+    _p_df = mark_to_market(_p_df, close_df, latest_market_date)
+    _p_units = _p_df.set_index("Ticker")["Units"]
 
-# Total value = ORIGINAL units x latest valid price + dividends whose ex-date has
-# passed + modelled G-Sec accrued coupon.
-df_master["TotalCurrentValue"] = (
-    df_master["CurrentValue"] + df_master["DividendEntitlement"] + df_master["AccruedInterest"]
-)
+    _p_events = div_hist.copy()
+    _p_events["Units"] = _p_events["Ticker"].map(_p_units)
+    _p_events["Dividend Entitlement"] = (
+        pd.to_numeric(_p_events["Dividend / Share"], errors="coerce")
+        * pd.to_numeric(_p_events["Units"], errors="coerce")
+    )
+    _p_counted = _p_events["Status"].eq(STATUS_ENTITLED)
+    if _p_counted.any():
+        _p_dividend_by_ticker = _p_events.loc[_p_counted].groupby("Ticker")["Dividend Entitlement"].sum()
+    else:
+        _p_dividend_by_ticker = pd.Series(dtype=float)
+    _p_df["DividendEntitlement"] = _p_df["Ticker"].map(_p_dividend_by_ticker).fillna(0.0)
+
+    # Current value = persona's units × latest valid price + passed dividends
+    # + modelled G-Sec accrued coupon.
+    _p_df["TotalCurrentValue"] = (
+        _p_df["CurrentValue"] + _p_df["DividendEntitlement"] + _p_df["AccruedInterest"]
+    )
+    _p_df["UnrealizedPnL"] = _p_df["CurrentValue"] - _p_df["Allocated_Amount"]
+    _p_df["TotalInvestmentGain"] = _p_df["TotalCurrentValue"] - _p_df["Allocated_Amount"]
+    _p_df["TotalInvestmentGainPct"] = np.where(
+        _p_df["Allocated_Amount"] != 0,
+        _p_df["TotalInvestmentGain"] / _p_df["Allocated_Amount"],
+        0.0,
+    )
+    _p_df["CurrentWeight"] = _p_df["TotalCurrentValue"] / _p_df["TotalCurrentValue"].sum()
+    persona_valuation_frames[_pname] = _p_df
+    _current_value = float(_p_df["TotalCurrentValue"].sum())
+    _pnl = _current_value - CORPUS
+    persona_value_summary[_pname] = {
+        "current_value": _current_value,
+        "pnl": _pnl,
+        "pnl_pct": _pnl / CORPUS,
+        "dividend_entitlement": float(_p_df["DividendEntitlement"].sum()),
+    }
+
+# The selected persona's detailed tables, dividend tracker and portfolio metrics
+# use the same persona-specific frozen units.
+df_master = persona_valuation_frames[selected_persona]
+dividend_entitlement = persona_value_summary[selected_persona]["dividend_entitlement"]
 df_master["UnrealizedPnL"] = df_master["CurrentValue"] - df_master["Allocated_Amount"]
 df_master["TotalInvestmentGain"] = df_master["TotalCurrentValue"] - df_master["Allocated_Amount"]
 df_master["TotalInvestmentGainPct"] = np.where(
@@ -1608,8 +1680,7 @@ portfolio_expected_return = float(
 )
 
 # The selected persona has its own freshly optimized recommendation. Use that
-# recommendation's expected return for the persona-sensitive projection cards.
-# Keep the original holdings, valuation, and P&L untouched.
+# recommendation's expected return for persona-sensitive projection cards.
 recommendation_expected_return = (
     float(optimization_meta["achieved_expected_return"])
     if optimization_meta is not None else np.nan
@@ -1715,10 +1786,9 @@ with hero_l:
             <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {latest_market_date.strftime("%d %b %Y").upper()} · INVESTED {INVESTMENT_DATE.strftime("%d %b %Y").upper()} · {lookback_yrs}Y LOOKBACK</div>
             <div class="hero-title">15-Asset Allocation Terminal</div>
             <p class="hero-sub">
-                ₹1.00 Cr invested on {INVESTMENT_DATE.strftime("%d %b %Y")} across 11 equities, 2 bonds, Gold ETF and Silver ETF
-                (original holdings set under the <strong style="color:{GOLD_SOFT}">{snapshot.get("persona", INCEPTION_PERSONA)}</strong> profile and locked).
-                Target comparisons use the selected <strong style="color:{GOLD_SOFT}">{selected_persona}</strong> objective;
-                the optimizer only produces a separate, current recommendation.
+                ₹1.00 Cr simulated on {INVESTMENT_DATE.strftime("%d %b %Y")} across 11 equities, 2 bonds, Gold ETF and Silver ETF.
+                This view uses the frozen <strong style="color:{GOLD_SOFT}">{selected_persona}</strong> allocation;
+                each investor profile has its own starting units and current market valuation.
             </p>
         </div>
         """,
@@ -1740,26 +1810,52 @@ with hero_r:
         unsafe_allow_html=True,
     )
 
-# Snapshot status (is the original portfolio permanent yet?)
-_snapshot_created = str(snapshot.get("created_at_utc", ""))[:10]
-if snapshot_kind == "repo":
-    st.caption(
-        f"Original holdings locked from inception_holdings.json (created {_snapshot_created}; "
-        f"{snapshot.get('persona', INCEPTION_PERSONA)} profile, {snapshot.get('lookback_yrs', INCEPTION_LOOKBACK_YRS)}Y lookback). "
-        f"Sidebar inputs do not change them."
-    )
-else:
+# Snapshot status: every persona's inception units need to be preserved.
+_missing_repo = [pname for pname in PERSONAS if persona_snapshot_kinds[pname] != "repo"]
+if _missing_repo:
     st.warning(
-        "Original holdings were established from 31 Aug 2026 data but are NOT permanent yet: "
-        "this server's disk is wiped whenever the app restarts or redeploys. Download the file "
-        "below and commit it to your GitHub repo root (next to Investment_Dashboard.py) as "
-        "inception_holdings.json to lock them permanently."
+        "One or more persona snapshots exist only as local autosaves and may be lost "
+        "when the hosting container restarts. Download and commit the files listed "
+        "below to the repository root to preserve all three simulated portfolios."
     )
-    st.download_button(
-        "⬇ Download inception_holdings.json",
-        data=json.dumps(snapshot, indent=2),
-        file_name="inception_holdings.json",
-        mime="application/json",
+with st.expander("Inception snapshots for all three personas", expanded=bool(_missing_repo)):
+    _download_cols = st.columns(3)
+    for _col, _pname in zip(_download_cols, PERSONAS):
+        _filename = (
+            "inception_holdings.json" if _pname == "Moderate"
+            else f"inception_holdings_{_pname.lower()}.json"
+        )
+        _created = str(persona_snapshots[_pname].get("created_at_utc", ""))[:10]
+        _col.caption(
+            f"**{_pname}** · {_filename} · created {_created} · "
+            f"{persona_snapshot_kinds[_pname]}"
+        )
+        _col.download_button(
+            f"Download {_pname}",
+            data=json.dumps(persona_snapshots[_pname], indent=2),
+            file_name=_filename,
+            mime="application/json",
+            key=f"download_snapshot_{_pname.lower()}",
+            use_container_width=True,
+        )
+
+# Current value comparison: same initial ₹1 Cr and entry date, but separate
+# persona-specific units allocated at inception.
+st.markdown('<div class="section-title">Current Portfolio Value by Persona</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-note">Each portfolio starts with ₹1 crore on 31 Aug 2026 and uses that persona’s frozen asset allocation. Values include latest available prices, counted dividend entitlements and modelled G-Sec coupon accrual.</div>',
+    unsafe_allow_html=True,
+)
+comparison_cols = st.columns(3)
+for _col, _pname in zip(comparison_cols, PERSONAS):
+    _pval = persona_value_summary[_pname]
+    _p_pnl = _pval["pnl"]
+    _p_delta_class = "kpi-delta-pos" if _p_pnl >= 0 else "kpi-delta-neg"
+    _col.markdown(
+        f'<div class="kpi-card"><div class="kpi-label">{_pname}</div>'
+        f'<div class="kpi-value">₹{_pval["current_value"]/1e7:.2f} Cr</div>'
+        f'<div class="{_p_delta_class}">P&amp;L: ₹{_p_pnl/1e5:+.2f} Lakh ({_pval["pnl_pct"]:+.2%})</div></div>',
+        unsafe_allow_html=True,
     )
 
 # ============================================================
@@ -1979,7 +2075,7 @@ i1.metric("Current Price", f"₹{selected_row['CurrentPrice']:,.2f}" if pd.notna
 i2.metric("Original Weight (locked)", f"{selected_row['Portfolio_Weight']:.2%}")
 i3.metric("Recommended Weight · " + selected_persona, f"{_selected_recommended_weight:.2%}" if np.isfinite(_selected_recommended_weight) else "N/A")
 i4.metric("Recommended Allocation", f"₹{_selected_recommended_amount/1e5:.2f} L" if np.isfinite(_selected_recommended_amount) else "N/A")
-i5.metric("Original Current Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
+i5.metric("Persona Portfolio Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
 
 detail_left, detail_right = st.columns([1, 1.4])
 
@@ -2067,7 +2163,7 @@ with tab_overview:
         )
         st.markdown(
             '<div class="section-note">Allocation recommended for the selected investor persona from a model corpus of ₹1 Cr. '
-            'Switch Aggressive, Moderate or Conservative in the sidebar to update this chart. Original holdings and their P&L remain locked.</div>',
+            'Switch Aggressive, Moderate or Conservative in the sidebar to update this chart. Each persona uses its own locked inception allocation.</div>',
             unsafe_allow_html=True,
         )
 
@@ -2095,7 +2191,7 @@ with tab_overview:
                 {"Sleeve": "Silver", "Amount": _orig_class["Silver ETF"]},
             ])
             _pie_center_text = "Original<br>holdings"
-            st.warning(f"The {selected_persona} recommendation is unavailable: {reco_error}. The chart shows original holdings for context.")
+            st.warning(f"The {selected_persona} recommendation is unavailable: {reco_error}. The chart shows the selected persona's inception holdings for context.")
 
         fig_pie = go.Figure(
             data=[
@@ -2248,7 +2344,7 @@ with tab_overview:
         unsafe_allow_html=True
     )
     st.markdown(
-        '<div class="section-note">Dividend events with an ex-date after the 31 Aug 2026 investment date, valued on the original units. Only events whose ex-date has passed are counted in portfolio value; later ones are listed as upcoming. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
+        '<div class="section-note">Dividend events with an ex-date after the 31 Aug 2026 investment date, valued on the selected persona’s units. Only events whose ex-date has passed are counted in portfolio value; later ones are listed as upcoming. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
         unsafe_allow_html=True,
     )
     required_display_cols = [
@@ -2304,7 +2400,7 @@ with tab_overview:
 with tab_holdings:
     st.markdown('<div class="section-title">All 15 Instruments</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-note">Original holdings: entry price, fixed units, current value, expected return and allocation.</div>',
+        '<div class="section-note">Selected persona’s inception holdings: entry price, fixed units, current value, expected return and allocation.</div>',
         unsafe_allow_html=True,
     )
 
@@ -2346,7 +2442,7 @@ with tab_holdings:
     rw5.metric("Silver", f"{asset_weights.get('Silver ETF', 0.0):.2%}")
 
     if abs(total_weight - 1.0) > 1e-8:
-        st.error("Original portfolio weights do not reconcile to 100%. Check the snapshot file.")
+        st.error(f"{selected_persona} portfolio weights do not reconcile to 100%. Check its snapshot file.")
 
     st.dataframe(
         display_df[cols],
@@ -2432,14 +2528,14 @@ with tab_holdings:
         )
         st.plotly_chart(fig_asset, use_container_width=True)
 
-# ---------- TAB 3: RECOMMENDATION (separate from the original holdings) ----------
+# ---------- TAB 3: RECOMMENDATION (separate from persona inception allocations) ----------
 with tab_reco:
     st.markdown('<div class="section-title">Persona Allocation Comparison</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="section-note">Each persona is optimized independently using the same latest market data. '
-        'Equity exposure bands are deliberately non-overlapping: Aggressive 72–86%, Moderate 55–69%, '
-        'and Conservative 35–49%. This guarantees different asset-class mixes; the optimizer separately '
-        'calculates each security weight. These recommendations do not change the locked original holdings.</div>',
+        'Each profile has a different asset-class mix derived from its allocation guardrails. The optimizer '
+        'calculates security weights separately; these current recommendations are distinct from the frozen '
+        'inception allocations used to calculate persona-specific portfolio values.</div>',
         unsafe_allow_html=True,
     )
 
@@ -2509,7 +2605,7 @@ with tab_reco:
         },
     )
 
-    st.markdown('<div class="section-title">Selected Persona vs Original Holdings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Selected Persona Recommendation vs Inception Allocation</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="section-note">The optimizer re-runs on current data (lookback {lookback_yrs}Y, Rf {rf_rate:.1%}, Rm {mkt_return:.1%}) for the {selected_persona} profile. '
         f'This is a suggestion only: it never changes your original units or the portfolio value above.</div>',
@@ -2527,7 +2623,7 @@ with tab_reco:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Recommended portfolio expected return", f"{optimization_meta['achieved_expected_return']:.2%}")
-        m2.metric("Original holdings expected return", f"{portfolio_expected_return:.2%}")
+        m2.metric("Selected inception allocation expected return", f"{portfolio_expected_return:.2%}")
         m3.metric("Target status (from inception)", "Feasible" if optimization_meta["target_feasible"] else "Not feasible")
         st.caption(optimization_meta["solver_status"])
 
@@ -2623,7 +2719,7 @@ with tab_risk:
         showlegend=True,
     )
     st.plotly_chart(fig_sml, use_container_width=True)
-    st.caption("Bubble size = original portfolio weight. Green = historical CAGR above CAPM-implied return.")
+    st.caption("Bubble size = selected persona's inception portfolio weight. Green = historical CAGR above CAPM-implied return.")
 
     r1, r2 = st.columns(2)
 
@@ -2758,8 +2854,8 @@ with tab_history:
 
 st.write("")
 st.caption(
-    "Educational/simulation dashboard. The original holdings (units) are fixed from the 31 Aug 2026 entry prices "
-    "and stored in a snapshot; current value is marked to the latest available trading price. Fractional units are "
+    "Educational/simulation dashboard. Each persona's holdings (units) are fixed from the 31 Aug 2026 entry prices "
+    "and stored in a separate snapshot; current value is marked to the latest available trading price. Fractional units are "
     "allowed (no cash residual). Historical CAGR, beta and CAPM metrics are model estimates. Dividends are tracked from "
     "NSE corporate actions where available, with Yahoo Finance as a fallback; payment settlement is not fabricated when "
     "the source does not expose it. The G-Sec is carried at indicative par with a modelled accrued coupon."
