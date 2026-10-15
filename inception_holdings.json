@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-10-15T02:53:18+00:00",
+  "investment_date": "2026-08-31",
+  "corpus": 10000000,
+  "persona": "Moderate",
+  "lookback_yrs": 5,
+  "rf_rate": 0.069,
+  "mkt_return": 0.13,
+  "optimizer_status": "Target is not feasible; weights maximize expected return within the current risk guardrails.",
+  "holdings": [
+    {
+      "Ticker": "INDIANB.NS",
+      "Name": "Indian Bank",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.020000000000000254,
+      "Allocated_Amount": 200000.00000000253,
+      "EntryPrice": 898.75,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 222.53129346314608
+    },
+    {
+      "Ticker": "HAL.NS",
+      "Name": "Hindustan Aeronautics (HAL)",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.01999999999999999,
+      "Allocated_Amount": 199999.9999999999,
+      "EntryPrice": 4801.60009765625,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 41.65278155871906
+    },
+    {
+      "Ticker": "CHENNPETRO.NS",
+      "Name": "Chennai Petroleum Corp",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.04999999999999982,
+      "Allocated_Amount": 499999.9999999982,
+      "EntryPrice": 1367.4000244140625,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 365.65744557028995
+    },
+    {
+      "Ticker": "MAZDOCK.NS",
+      "Name": "Mazagon Dock Shipbuilders",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.2199999999999999,
+      "Allocated_Amount": 2199999.999999999,
+      "EntryPrice": 2480.0,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 887.096774193548
+    },
+    {
+      "Ticker": "BSE.NS",
+      "Name": "BSE Ltd.",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.01999999999999999,
+      "Allocated_Amount": 199999.9999999999,
+      "EntryPrice": 3282.0,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 60.93845216331503
+    },
+    {
+      "Ticker": "NATIONALUM.NS",
+      "Name": "National Aluminium Co (NALCO)",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.2199999999999999,
+      "Allocated_Amount": 2199999.999999999,
+      "EntryPrice": 381.5,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 5766.710353866315
+    },
+    {
+      "Ticker": "FORCEMOT.NS",
+      "Name": "Force Motors",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.02000000000000004,
+      "Allocated_Amount": 200000.00000000038,
+      "EntryPrice": 17526.0,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 11.411617026132625
+    },
+    {
+      "Ticker": "LLOYDSME.NS",
+      "Name": "Lloyds Metals & Energy",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.01999999999999999,
+      "Allocated_Amount": 199999.9999999999,
+      "EntryPrice": 1794.5999755859375,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 111.44544896959549
+    },
+    {
+      "Ticker": "APARINDS.NS",
+      "Name": "Apar Industries",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.019999999999999997,
+      "Allocated_Amount": 199999.99999999997,
+      "EntryPrice": 17702.0,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 11.29815840018077
+    },
+    {
+      "Ticker": "OIL.NS",
+      "Name": "Oil India",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.01999999999999999,
+      "Allocated_Amount": 199999.9999999999,
+      "EntryPrice": 483.1499938964844,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 413.9501242399896
+    },
+    {
+      "Ticker": "TVSMOTOR.NS",
+      "Name": "TVS Motor Company",
+      "Type": "Equity",
+      "Portfolio_Weight": 0.020000000000000125,
+      "Allocated_Amount": 200000.00000000125,
+      "EntryPrice": 4341.2998046875,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 46.06915186646453
+    },
+    {
+      "Ticker": "GSEC2029",
+      "Name": "6.03% GOI G-Sec 2029",
+      "Type": "Bond",
+      "Portfolio_Weight": 0.01999999999999999,
+      "Allocated_Amount": 199999.9999999999,
+      "EntryPrice": 100.0,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "Indicative par price (no market feed)",
+      "Units": 1999.999999999999
+    },
+    {
+      "Ticker": "EBBETF0431.NS",
+      "Name": "BHARAT Bond ETF April 2031",
+      "Type": "Bond",
+      "Portfolio_Weight": 0.0800000000000002,
+      "Allocated_Amount": 800000.000000002,
+      "EntryPrice": 1436.3900146484375,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 556.9517971035223
+    },
+    {
+      "Ticker": "GOLDBEES.NS",
+      "Name": "Nippon India ETF Gold BeES",
+      "Type": "Gold ETF",
+      "Portfolio_Weight": 0.14999999999999994,
+      "Allocated_Amount": 1499999.9999999993,
+      "EntryPrice": 127.31999969482422,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 11781.338388276614
+    },
+    {
+      "Ticker": "SILVERBEES.NS",
+      "Name": "Nippon India Silver ETF",
+      "Type": "Silver ETF",
+      "Portfolio_Weight": 0.09999999999999996,
+      "Allocated_Amount": 999999.9999999997,
+      "EntryPrice": 223.2100067138672,
+      "EntryPriceDate": "2026-08-31",
+      "EntryStatus": "OK",
+      "Units": 4480.0858828963665
+    }
+  ]
+}
