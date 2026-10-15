@@ -1545,10 +1545,24 @@ elapsed_years_now = min(
     max((latest_market_date - INVESTMENT_DATE).days / 365.25, 0.0), float(HORIZON_YEARS)
 )
 
-# Modelled return of the ACTUAL holdings: current market-value weights x current
-# expected returns (current beta / CAPM / dividend yield).
+# Modelled return of the ACTUAL / ORIGINAL holdings. This remains useful for
+# evaluating the existing portfolio, but it is NOT the selected-persona
+# recommendation return.
 portfolio_expected_return = float(
     (df_master["CurrentWeight"] * df_master["Total_Expected_Return"]).sum()
+)
+
+# The selected persona has its own freshly optimized recommendation. Use that
+# recommendation's expected return for the persona-sensitive projection cards.
+# Keep the original holdings, valuation, and P&L untouched.
+recommendation_expected_return = (
+    float(optimization_meta["achieved_expected_return"])
+    if optimization_meta is not None else np.nan
+)
+projection_expected_return = (
+    recommendation_expected_return
+    if np.isfinite(recommendation_expected_return)
+    else portfolio_expected_return
 )
 
 if remaining_years > 0 and current_portfolio_value > 0:
@@ -1564,8 +1578,8 @@ else:
 
 live_expected_end_value = (
     current_portfolio_value
-    * (1.0 + portfolio_expected_return) ** remaining_years
-    if remaining_years > 0
+    * (1.0 + projection_expected_return) ** remaining_years
+    if remaining_years > 0 and np.isfinite(projection_expected_return)
     else current_portfolio_value
 )
 
@@ -1580,7 +1594,8 @@ live_target_achievable = (
     current_portfolio_value >= persona_cfg["target_corpus"]
     or (
         np.isfinite(live_required_cagr)
-        and portfolio_expected_return >= live_required_cagr
+        and np.isfinite(projection_expected_return)
+        and projection_expected_return >= live_required_cagr
     )
 )
 portfolio_realized_cagr = float(
@@ -1725,9 +1740,9 @@ k3.markdown(
 )
 k4.markdown(
     kpi_card(
-        "Current Modelled Return",
-        f"{portfolio_expected_return:.2%}",
-        '<div class="kpi-delta-pos">Original holdings · current market/risk data</div>',
+        "Recommended Portfolio Return",
+        f"{projection_expected_return:.2%}" if np.isfinite(projection_expected_return) else "N/A",
+        '<div class="kpi-delta-pos">Selected persona · optimized recommendation</div>',
     ),
     unsafe_allow_html=True,
 )
@@ -1762,7 +1777,7 @@ with proj_l:
             <div class="hero-big-number">₹{live_expected_end_value/1e7:.2f} Cr</div>
             <div class="hero-big-label">
                 Estimated portfolio value on {target_date.strftime("%d %b %Y")}
-                if today's portfolio value and modelled annual return continue.
+                using the selected persona's recommended annual return. This is a model estimate, not a guarantee.
             </div>
         </div>
         """,
@@ -1775,7 +1790,7 @@ with proj_r:
             <div class="hero-eyebrow">PROJECTED GAIN BY TARGET DATE</div>
             <div class="hero-big-number">₹{live_projected_gain/1e5:.2f} L</div>
             <div class="hero-big-label">
-                Projected gain of {live_projected_gain_pct:.2%} from today's
+                Modelled gain of {live_projected_gain_pct:.2%} from today's
                 ₹{current_portfolio_value/1e7:.2f} Cr over the remaining horizon.
             </div>
         </div>
@@ -1838,7 +1853,7 @@ else:
 
 if live_target_achievable:
     st.success(
-        f"Live target check: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
+        f"Live target check using the selected persona's recommendation: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
         f"With {remaining_years:.2f} years remaining until {target_date.strftime('%d %b %Y')}, "
         f"the portfolio needs {live_required_cagr:.2%} CAGR from today to reach the fixed "
         f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr target. "
@@ -1846,11 +1861,11 @@ if live_target_achievable:
     )
 else:
     st.warning(
-        f"Live target check: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
+        f"Live target check using the selected persona's recommendation: current portfolio value is ₹{current_portfolio_value/1e7:.2f} Cr. "
         f"With {remaining_years:.2f} years remaining until {target_date.strftime('%d %b %Y')}, "
         f"the portfolio needs {live_required_cagr:.2%} CAGR from today to reach the fixed "
         f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr target, "
-        f"versus a current modelled return of {portfolio_expected_return:.2%}. "
+        f"versus a selected-persona recommended return of {projection_expected_return:.2%}. "
         f"The target is currently at risk."
     )
 
@@ -2032,7 +2047,7 @@ with tab_overview:
         fig_growth = go.Figure()
         live_elapsed = np.linspace(0, max(remaining_years, 0.0), HORIZON_YEARS + 1)
         live_projection_path = (
-            current_portfolio_value * (1.0 + portfolio_expected_return) ** live_elapsed
+            current_portfolio_value * (1.0 + projection_expected_return) ** live_elapsed
         )
 
         fig_growth.add_trace(
@@ -2040,7 +2055,7 @@ with tab_overview:
                 x=[elapsed_years_now + x for x in live_elapsed],
                 y=live_projection_path,
                 mode="lines+markers",
-                name=f"Live Projection ({portfolio_expected_return:.2%})",
+                name=f"Selected Persona Projection ({projection_expected_return:.2%})",
                 line=dict(color=GOLD, width=3),
             )
         )
