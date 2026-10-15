@@ -1,6 +1,8 @@
-import warnings
+import json
+import os
 import re
-from datetime import datetime
+import warnings
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -266,11 +268,52 @@ pio.templates.default = "portfolio_light"
 # ============================================================
 # 4. MASTER PORTFOLIO CONFIGURATION
 # ============================================================
-VALUATION_DATE = pd.Timestamp("2026-08-31")
+# THREE DISTINCT DATES (never mix them up):
+#   INVESTMENT_DATE  - fixed simulated purchase date.
+#   latest_market_date (computed at run time) - the "current valuation date".
+#   TARGET_DATE      - fixed end of the 3-year horizon.
+INVESTMENT_DATE = pd.Timestamp("2026-08-31")
+TARGET_DATE = pd.Timestamp("2029-08-31")
 CORPUS = 1_00_00_000
 HORIZON_YEARS = 3
 DEFAULT_RF = 0.069
 DEFAULT_RM = 0.130
+assert TARGET_DATE == INVESTMENT_DATE + pd.DateOffset(years=HORIZON_YEARS), (
+    "TARGET_DATE must equal INVESTMENT_DATE + HORIZON_YEARS"
+)
+
+# The ORIGINAL ₹1 Cr portfolio is established once, as of INVESTMENT_DATE, using
+# these inception settings, and is then frozen in a snapshot file.
+# Sidebar inputs (persona / lookback / Rf / Rm) only drive the CURRENT
+# recommendation and modelled returns - never the original holdings.
+INCEPTION_PERSONA = "Moderate"
+INCEPTION_LOOKBACK_YRS = 5
+INCEPTION_RF = DEFAULT_RF
+INCEPTION_RM = DEFAULT_RM
+
+# Data-quality thresholds
+ENTRY_MAX_STALENESS_DAYS = 7     # entry price may be at most this many days before INVESTMENT_DATE
+CURRENT_STALE_DAYS = 5           # current price older than this (vs latest market date) is flagged STALE
+HISTORY_BUFFER_DAYS = 10
+
+# G-Sec has no Yahoo price feed: it is carried at indicative par (100) and,
+# optionally, accrues its coupon as simple interest (actual/365).
+GSEC_TICKER = "GSEC2029"
+GSEC_PAR_PRICE = 100.0
+GSEC_COUPON_RATE = 0.0603        # taken from the instrument name "6.03% GOI G-Sec 2029"
+GSEC_ACCRUE_COUPON = True
+GSEC_STATUS = "Indicative par price (no market feed)"
+
+STATUS_ENTITLED = "Entitled / return accrued"
+STATUS_UPCOMING = "Declared / upcoming"
+
+try:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    APP_DIR = os.getcwd()
+SNAPSHOT_PATH = os.path.join(APP_DIR, "inception_holdings.json")
+AUTOSAVE_PATH = os.path.join(APP_DIR, ".inception_holdings_autosave.json")
+SNAPSHOT_SCHEMA_VERSION = 1
 
 # Persona target = objective only.
 # It is displayed as the person's desired outcome and used to
@@ -340,68 +383,128 @@ INSTRUMENTS_MASTER = [
     {"Ticker": "SILVERBEES.NS", "Name": "Nippon India Silver ETF", "Sector": "Precious Metals",
      "CapCategory": "Silver ETF", "Type": "Silver ETF"},
 ]
+ALL_TICKERS = [item["Ticker"] for item in INSTRUMENTS_MASTER]
+YAHOO_TICKERS = [t for t in ALL_TICKERS if t != GSEC_TICKER]
+EQUITY_TICKERS = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Type"] == "Equity"]
 
 # ============================================================
-# 5. LIVE DATA ENGINE
+# 5. DATA ENGINE
 # ============================================================
-@st.cache_data(ttl=23 * 60 * 60, show_spinner=False)
-def fetch_live_market_data(lookback_yrs=5):
-    tickers = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Ticker"] != "GSEC2029"]
-    # Nifty 50 is the benchmark used by the current CAPM implementation.
-    tickers.append("^NSEI")
+def _clean_index(df):
+    """Timezone-naive, midnight-normalised, de-duplicated, sorted DatetimeIndex."""
+    df = df.copy()
+    idx = pd.to_datetime(df.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    df.index = idx.normalize()
+    df = df[~df.index.duplicated(keep="last")]
+    return df.sort_index()
 
-    raw = yf.download(
-        tickers,
-        period=f"{max(lookback_yrs, 1)}y",
-        interval="1wk",
-        auto_adjust=True,
-        progress=False,
-        group_by="column",
-    )
-    if raw.empty:
-        raise RuntimeError("Yahoo Finance returned no price data.")
 
+def _extract_field(raw, field):
+    """Pull one price field (e.g. 'Close', 'Adj Close') out of a yfinance frame."""
     if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" in raw.columns.get_level_values(0):
-            prices = raw["Close"]
-        else:
-            prices = raw.xs("Close", level=1, axis=1)
-    else:
-        prices = raw.copy()
-
-    prices.index = pd.to_datetime(prices.index)
-    if getattr(prices.index, "tz", None) is not None:
-        prices.index = prices.index.tz_localize(None)
-
-    return prices.sort_index().dropna(how="all")
-
+        if field in raw.columns.get_level_values(0):
+            return raw[field]
+        if field in raw.columns.get_level_values(1):
+            return raw.xs(field, level=1, axis=1)
+        return None
+    return None
 
 
 @st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
-def fetch_daily_prices():
-    """Recent daily closes for day-over-day price changes and current value."""
-    tickers = [item["Ticker"] for item in INSTRUMENTS_MASTER if item["Ticker"] != "GSEC2029"]
+def fetch_price_history():
+    """
+    ONE daily download covering the inception lookback window up to the latest
+    available trading day. Returns (close_df, adj_close_df):
+
+      close_df     - raw (split-adjusted, NOT dividend-adjusted) closes. Used for
+                     entry prices, current prices and portfolio valuation, so that
+                     later dividends cannot retroactively change the 31 Aug entry
+                     price (and dividends are not double counted).
+      adj_close_df - dividend-adjusted closes. Used only for return statistics
+                     (beta, volatility, historical CAGR).
+
+    Exceptions are deliberately NOT swallowed here so Streamlit never caches a
+    failed/empty download.
+    """
+    tickers = YAHOO_TICKERS + ["^NSEI"]
+    start = (
+        INVESTMENT_DATE
+        - pd.DateOffset(years=INCEPTION_LOOKBACK_YRS)
+        - pd.Timedelta(days=HISTORY_BUFFER_DAYS)
+    )
     raw = yf.download(
         tickers,
-        period="15d",
+        start=start.strftime("%Y-%m-%d"),
         interval="1d",
-        auto_adjust=True,
+        auto_adjust=False,
         progress=False,
         group_by="column",
+        threads=True,
     )
-    if raw.empty:
-        return pd.DataFrame()
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw.xs("Close", level=1, axis=1)
-    else:
-        prices = raw.copy()
-    prices.index = pd.to_datetime(prices.index)
-    if getattr(prices.index, "tz", None) is not None:
-        prices.index = prices.index.tz_localize(None)
-    return prices.sort_index().dropna(how="all")
+    if raw is None or raw.empty:
+        raise RuntimeError("Yahoo Finance returned no price data.")
+
+    close = _extract_field(raw, "Close")
+    adj = _extract_field(raw, "Adj Close")
+    if close is None:
+        raise RuntimeError("Yahoo Finance response did not contain 'Close' prices.")
+    if adj is None:
+        adj = close.copy()
+
+    close = _clean_index(close).dropna(how="all")
+    adj = _clean_index(adj).dropna(how="all")
+    return close, adj
 
 
-def asof_series(series, valuation_date):
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def fetch_dividend_series(ticker):
+    """Per-share dividend history (point-in-time facts). Raises on failure so a
+    failed call is never cached."""
+    d = yf.Ticker(ticker).dividends
+    if d is None:
+        raise RuntimeError(f"No dividend series returned for {ticker}.")
+    d = d.copy()
+    idx = pd.to_datetime(d.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    d.index = idx.normalize()
+    return d.astype(float)
+
+
+def get_dividend_map():
+    """ticker -> dividend Series, or None when the retrieval failed."""
+    out = {}
+    for t in EQUITY_TICKERS:
+        try:
+            out[t] = fetch_dividend_series(t)
+        except Exception:
+            out[t] = None
+    return out
+
+
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def _fetch_market_cap_cr(ticker):
+    info = yf.Ticker(ticker).info or {}
+    mc = info.get("marketCap")
+    if mc is None:
+        raise RuntimeError(f"No market cap for {ticker}.")
+    return float(mc) / 1e7  # ₹ crore
+
+
+def get_market_caps():
+    """Display-only (never used in any calculation)."""
+    out = {}
+    for t in EQUITY_TICKERS:
+        try:
+            out[t] = _fetch_market_cap_cr(t)
+        except Exception:
+            out[t] = np.nan
+    return out
+
+
+def asof_series(series, as_of_date):
     s = series.dropna().copy()
     if s.empty:
         return pd.Series(dtype=float)
@@ -409,7 +512,7 @@ def asof_series(series, valuation_date):
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_localize(None)
     s.index = idx
-    s = s.loc[s.index <= valuation_date].sort_index()
+    s = s.loc[s.index <= as_of_date].sort_index()
     return s
 
 
@@ -423,376 +526,114 @@ def compute_beta(asset_returns, benchmark_returns):
     return float(np.cov(combined.iloc[:, 0], combined.iloc[:, 1], ddof=1)[0, 1] / mkt_var)
 
 
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def fetch_yahoo_info(ticker):
-    """Cache Yahoo metadata to reduce repeated .info requests per rerun."""
-    try:
-        return yf.Ticker(ticker).info or {}
-    except Exception:
-        return {}
-
-
-def fetch_dividend_yield(ticker):
-    try:
-        info = fetch_yahoo_info(ticker)
-        div = info.get("dividendYield")
-        if div is None:
-            return 0.0
-        div = float(div)
-        # yfinance normally reports this as a decimal (e.g. 0.025 = 2.5%).
-        # Guard against sources returning percent-formatted values.
-        return div / 100.0 if div > 1 else div
-    except Exception:
+def compute_trailing_dividend_yield(div_series, price, as_of):
+    """Trailing-12-month dividends / price, using dividend facts dated on or
+    before `as_of` only (point-in-time, so it cannot drift between reruns)."""
+    if div_series is None or price is None:
         return 0.0
-
-
-
-def _nse_session():
-    """Create a browser-like NSE session for official public API calls."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
-        "Connection": "keep-alive",
-    })
-    try:
-        session.get("https://www.nseindia.com/", timeout=15)
-    except Exception:
-        pass
-    return session
-
-
-def _parse_dividend_amount(purpose):
-    """Extract dividend per share from NSE's purpose text."""
-    text = str(purpose or "")
-    patterns = [
-        r"Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
-        r"Interim Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
-        r"Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
-        r"Interim Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
-        r"Dividend[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+    if not np.isfinite(price) or price <= 0:
+        return 0.0
+    as_of = pd.Timestamp(as_of)
+    window = div_series[
+        (div_series.index > as_of - pd.DateOffset(years=1)) & (div_series.index <= as_of)
     ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.I)
-        if m:
-            return float(m.group(1))
-    return np.nan
+    y = float(window.sum()) / float(price)
+    return float(np.clip(y, 0.0, 0.15))
 
 
-def _normalize_nse_date(value):
-    return pd.to_datetime(value, errors="coerce", dayfirst=False)
-
-
-@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
-def fetch_nse_dividends(symbols, start_date, end_date):
+def select_entry_prices(close_df, investment_date, tickers):
     """
-    PRIMARY dividend feed: NSE public corporate-actions + corporate-announcements APIs.
-
-    Corporate Actions provides dividend amount, ex-date and record date.
-    Corporate Announcements provides the company's exchange broadcast date.
-    This is more authoritative for an NSE-listed portfolio than relying on
-    yfinance's dividend history alone.
+    For every instrument pick the LAST valid close on or before the investment
+    date, record that date, and verify it. Never falls back to a current price.
     """
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
-    session = _nse_session()
-
     rows = []
-
-    for symbol in symbols:
-        # ---------- Official corporate actions ----------
-        actions_url = (
-            "https://www.nseindia.com/api/corporates-corporateActions"
-            f"?index=equities&symbol={symbol}"
-        )
-        actions = []
-        try:
-            r = session.get(actions_url, timeout=15)
-            r.raise_for_status()
-            payload = r.json()
-            if isinstance(payload, dict):
-                actions = payload.get("data", payload.get("corporateActions", []))
-            elif isinstance(payload, list):
-                actions = payload
-        except Exception:
-            actions = []
-
-        # ---------- Official corporate announcements ----------
-        announcements_url = (
-            "https://www.nseindia.com/api/corporate-announcements"
-            f"?index=equities&symbol={symbol}"
-        )
-        announcements = []
-        try:
-            r = session.get(announcements_url, timeout=15)
-            r.raise_for_status()
-            payload = r.json()
-            if isinstance(payload, dict):
-                announcements = payload.get("data", [])
-            elif isinstance(payload, list):
-                announcements = payload
-        except Exception:
-            announcements = []
-
-        dividend_actions = []
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-
-            purpose = action.get("subject", action.get("purpose", ""))
-            if "DIVIDEND" not in str(purpose).upper():
-                continue
-
-            ex_date = _normalize_nse_date(
-                action.get("exDate", action.get("ex_date"))
-            )
-            record_date = _normalize_nse_date(
-                action.get("recDate", action.get("recordDate", action.get("record_date")))
-            )
-            amount = _parse_dividend_amount(purpose)
-
-            if pd.isna(ex_date) and pd.isna(record_date):
-                continue
-
-            # Keep only events relevant to the portfolio's investment period.
-            action_date = ex_date if pd.notna(ex_date) else record_date
-            if pd.notna(action_date) and (
-                action_date < start_date or action_date > end_date
-            ):
-                continue
-
-            dividend_actions.append({
-                "Symbol": symbol,
-                "NSE Purpose": purpose,
-                "Dividend / Share": amount,
-                "Ex-Date": ex_date,
-                "Record Date": record_date,
-                "Source": "NSE Corporate Actions API",
-            })
-
-        # Match the closest dividend-related corporate announcement to each
-        # corporate action. The announcement feed's `an_dt` is an exchange
-        # broadcast timestamp.
-        for row in dividend_actions:
-            relevant_ann = []
-            for ann in announcements:
-                if not isinstance(ann, dict):
-                    continue
-                subject = str(ann.get("desc", ann.get("subject", "")))
-                if "DIVIDEND" not in subject.upper():
-                    continue
-
-                ann_date = _normalize_nse_date(
-                    ann.get("an_dt", ann.get("sort_date", ann.get("broadcastDate")))
-                )
-                if pd.notna(ann_date):
-                    if start_date - pd.Timedelta(days=30) <= ann_date <= end_date:
-                        relevant_ann.append((ann_date, subject))
-
-            if relevant_ann:
-                # Prefer the latest dividend announcement not materially after
-                # the ex-date; otherwise take the nearest announcement date.
-                ex_date = row["Ex-Date"]
-                if pd.notna(ex_date):
-                    prior = [x for x in relevant_ann if x[0] <= ex_date]
-                    chosen = max(prior, key=lambda x: x[0]) if prior else min(
-                        relevant_ann, key=lambda x: abs((x[0] - ex_date).days)
-                    )
-                else:
-                    chosen = max(relevant_ann, key=lambda x: x[0])
-                row["NSE Announcement Date"] = chosen[0]
-                row["NSE Announcement Subject"] = chosen[1]
-            else:
-                row["NSE Announcement Date"] = pd.NaT
-                row["NSE Announcement Subject"] = ""
-
-        rows.extend(dividend_actions)
-
-    if not rows:
-        return pd.DataFrame(columns=[
-            "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
-            "NSE Announcement Date", "NSE Announcement Subject", "Source"
-        ])
-
-    df = pd.DataFrame(rows)
-
-    # De-duplicate actions by symbol + ex-date + dividend amount.
-    df = df.drop_duplicates(
-        subset=["Symbol", "Ex-Date", "Dividend / Share"],
-        keep="last",
-    )
-    return df.sort_values(["Symbol", "Ex-Date"], ascending=[True, False])
-
-
-@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
-def fetch_yahoo_dividends_fallback(symbols, start_date, end_date):
-    """Fallback only for symbols where NSE does not return an action."""
-    rows = []
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
-
-    for symbol in symbols:
-        ticker = symbol + ".NS"
-        try:
-            div = yf.Ticker(ticker).dividends
-            div.index = pd.to_datetime(div.index)
-            if getattr(div.index, "tz", None) is not None:
-                div.index = div.index.tz_localize(None)
-            div = div[(div.index >= start_date) & (div.index <= end_date)]
-        except Exception:
-            div = pd.Series(dtype=float)
-
-        for event_date, amount in div.items():
+    for t in tickers:
+        if t == GSEC_TICKER:
             rows.append({
-                "Symbol": symbol,
-                "NSE Purpose": "Yahoo Finance dividend action",
-                "Dividend / Share": float(amount),
-                "Ex-Date": pd.Timestamp(event_date),
-                "Record Date": pd.NaT,
-                "NSE Announcement Date": pd.NaT,
-                "NSE Announcement Subject": "",
-                "Source": "Yahoo Finance fallback",
+                "Ticker": t, "EntryPrice": GSEC_PAR_PRICE,
+                "EntryPriceDate": investment_date, "EntryStatus": GSEC_STATUS,
             })
-
-    if not rows:
-        return pd.DataFrame(columns=[
-            "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
-            "NSE Announcement Date", "NSE Announcement Subject", "Source"
-        ])
+            continue
+        s = asof_series(close_df[t], investment_date) if t in close_df.columns else pd.Series(dtype=float)
+        if s.empty:
+            rows.append({"Ticker": t, "EntryPrice": np.nan,
+                         "EntryPriceDate": pd.NaT, "EntryStatus": "MISSING (no price on or before investment date)"})
+            continue
+        d = pd.Timestamp(s.index[-1])
+        p = float(s.iloc[-1])
+        if (not np.isfinite(p)) or p <= 0 or d > investment_date:
+            status = "INVALID"
+        else:
+            age = (investment_date - d).days
+            status = "OK" if age <= ENTRY_MAX_STALENESS_DAYS else f"STALE ({age} days before investment date)"
+        rows.append({"Ticker": t, "EntryPrice": p, "EntryPriceDate": d, "EntryStatus": status})
     return pd.DataFrame(rows)
 
 
-def build_dividend_tracker(units_by_ticker, valuation_date, today):
-    """Build one consolidated, auditable dividend ledger."""
-    symbols = [
-        item["Ticker"].replace(".NS", "")
-        for item in INSTRUMENTS_MASTER
-        if item["Type"] == "Equity"
-    ]
-
-    nse_df = fetch_nse_dividends(symbols, valuation_date, today)
-
-    # Identify symbols not covered by the official feed and use Yahoo only for them.
-    covered = set(nse_df["Symbol"].dropna().astype(str)) if not nse_df.empty else set()
-    missing_symbols = [s for s in symbols if s not in covered]
-    yahoo_df = fetch_yahoo_dividends_fallback(missing_symbols, valuation_date, today)
-
-    if nse_df.empty:
-        tracker = yahoo_df.copy()
-    elif yahoo_df.empty:
-        tracker = nse_df.copy()
-    else:
-        tracker = pd.concat([nse_df, yahoo_df], ignore_index=True)
-
-    required = [
-        "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
-        "NSE Announcement Date", "NSE Announcement Subject", "Source"
-    ]
-    for col in required:
-        if col not in tracker.columns:
-            tracker[col] = "" if "Date" not in col and col not in {"Dividend / Share"} else pd.NaT
-
-    tracker["Ticker"] = tracker["Symbol"].map(
-        {item["Ticker"].replace(".NS", ""): item["Ticker"] for item in INSTRUMENTS_MASTER}
+def add_return_decomposition(df):
+    df = df.copy()
+    df["CapitalGainExpected"] = np.where(
+        df["Type"].eq("Equity"),
+        df["CAPM_Return"],
+        np.where(df["Type"].isin(["Gold ETF", "Silver ETF"]), df["Actual_CAGR"], 0.0),
     )
-    tracker["Company"] = tracker["Ticker"].map(
-        {item["Ticker"]: item["Name"] for item in INSTRUMENTS_MASTER}
+    df["ExpectedIncomeYield"] = np.where(
+        df["Type"].eq("Equity"),
+        df["DivYield"],
+        np.where(df["Type"].eq("Bond"), df["Total_Expected_Return"], 0.0),
     )
-    tracker["Units"] = tracker["Ticker"].map(units_by_ticker)
-    tracker["Dividend Entitlement"] = (
-        pd.to_numeric(tracker["Dividend / Share"], errors="coerce")
-        * pd.to_numeric(tracker["Units"], errors="coerce")
+    return df
+
+
+def analyze_instruments(close_df, adj_df, div_map, as_of, lookback_yrs, rf_rate, mkt_return):
+    """
+    Risk/return statistics for the 15 instruments using ONLY data dated on or
+    before `as_of`, over a window of `lookback_yrs` ending at `as_of`.
+
+      as_of = INVESTMENT_DATE      -> inception analysis (frozen into the snapshot)
+      as_of = latest market date   -> current analysis (recommendation / projection)
+    """
+    as_of = pd.Timestamp(as_of)
+    window_start = as_of - pd.DateOffset(years=int(lookback_yrs))
+    adj_win = adj_df.loc[(adj_df.index >= window_start) & (adj_df.index <= as_of)]
+    weekly_prices = adj_win.resample("W-FRI").last().dropna(how="all")
+    weekly_returns = weekly_prices.pct_change(fill_method=None).dropna(how="all")
+    nifty_returns = (
+        weekly_returns["^NSEI"].dropna()
+        if "^NSEI" in weekly_returns.columns else pd.Series(dtype=float)
     )
-
-    # Dividend is economically attributable to the portfolio once the ex-date
-    # has passed and the holder was entitled. Actual bank/DP cash receipt is
-    # not fabricated because NSE public corporate-actions data doesn't expose
-    # a universal payment confirmation field.
-    tracker["Status"] = np.where(
-        pd.to_datetime(tracker["Ex-Date"], errors="coerce").notna()
-        & (pd.to_datetime(tracker["Ex-Date"], errors="coerce") <= today),
-        "Entitled / return accrued",
-        "Declared / upcoming",
-    )
-
-    tracker["NSE Verified"] = np.where(
-        tracker["Source"].astype(str).str.startswith("NSE"),
-        "Yes",
-        "Fallback",
-    )
-
-    return tracker.sort_values(
-        ["Ex-Date", "Company"], ascending=[False, True], na_position="last"
-    ).reset_index(drop=True)
-
-
-
-def analyze_live_performance(prices_df, rf_rate, mkt_return):
-    weekly_returns = prices_df.pct_change().dropna(how="all")
-    nifty_returns = weekly_returns["^NSEI"].dropna() if "^NSEI" in weekly_returns.columns else pd.Series(dtype=float)
 
     records = []
-
     for item in INSTRUMENTS_MASTER:
         t = item["Ticker"]
         rec = item.copy()
 
-        if t == "GSEC2029":
-            # Indicative quote represented per 100 face value.
+        if t == GSEC_TICKER:
             rec.update({
-                "LivePrice": 100.0,
-                "PriceDate": VALUATION_DATE,
-                "Actual_CAGR": item["FixedYield"],
-                "Beta": 0.0,
-                "Volatility": 0.0,
-                "DivYield": 0.0,
-                "CAPM_Return": item["FixedYield"],
-                "Total_Expected_Return": item["FixedYield"],
+                "Actual_CAGR": item["FixedYield"], "Beta": 0.0, "Volatility": 0.0,
+                "DivYield": 0.0, "CAPM_Return": item["FixedYield"],
+                "Total_Expected_Return": item["FixedYield"], "AnalysisOK": True,
             })
             records.append(rec)
             continue
 
-        if t not in prices_df.columns:
+        px_adj = weekly_prices[t].dropna() if t in weekly_prices.columns else pd.Series(dtype=float)
+        raw_px = asof_series(close_df[t], as_of) if t in close_df.columns else pd.Series(dtype=float)
+
+        if px_adj.empty or raw_px.empty:
             rec.update({
-                "LivePrice": np.nan,
-                "PriceDate": pd.NaT,
-                "Actual_CAGR": 0.0,
-                "Beta": 1.0,
-                "Volatility": 0.0,
-                "DivYield": 0.0,
-                "CAPM_Return": 0.0,
-                "Total_Expected_Return": 0.0,
+                "Actual_CAGR": 0.0, "Beta": 1.0, "Volatility": 0.0, "DivYield": 0.0,
+                "CAPM_Return": 0.0, "Total_Expected_Return": 0.0, "AnalysisOK": False,
             })
             records.append(rec)
             continue
 
-        px_series = asof_series(prices_df[t], VALUATION_DATE)
-        if px_series.empty:
-            rec.update({
-                "LivePrice": np.nan,
-                "PriceDate": pd.NaT,
-                "Actual_CAGR": 0.0,
-                "Beta": 1.0,
-                "Volatility": 0.0,
-                "DivYield": 0.0,
-                "CAPM_Return": 0.0,
-                "Total_Expected_Return": 0.0,
-            })
-            records.append(rec)
-            continue
+        latest_adj = float(px_adj.iloc[-1])
+        latest_raw = float(raw_px.iloc[-1])
 
-        latest_px = float(px_series.iloc[-1])
-        price_date = px_series.index[-1]
-
-        if len(px_series) >= 2:
-            elapsed_years = max((px_series.index[-1] - px_series.index[0]).days / 365.25, 1/52)
-            actual_cagr = (latest_px / float(px_series.iloc[0])) ** (1 / elapsed_years) - 1
+        if len(px_adj) >= 2:
+            elapsed_years = max((px_adj.index[-1] - px_adj.index[0]).days / 365.25, 1 / 52)
+            actual_cagr = (latest_adj / float(px_adj.iloc[0])) ** (1 / elapsed_years) - 1
         else:
             actual_cagr = 0.0
 
@@ -803,42 +644,28 @@ def analyze_live_performance(prices_df, rf_rate, mkt_return):
             beta = 1.0
             vol = 0.0
 
-        div_yield = fetch_dividend_yield(t) if item["Type"] == "Equity" else 0.0
-
-        market_cap_cr = np.nan
-        try:
-            info = fetch_yahoo_info(t)
-            raw_mc = info.get("marketCap")
-            if raw_mc is not None:
-                market_cap_cr = float(raw_mc) / 1e7  # ₹ crore
-        except Exception:
-            market_cap_cr = np.nan
-
         if item["Type"] == "Equity":
+            div_yield = compute_trailing_dividend_yield(div_map.get(t), latest_raw, as_of)
             capm_return = rf_rate + beta * (mkt_return - rf_rate)
             total_expected = capm_return + div_yield
         elif item["Type"] == "Bond":
+            div_yield = 0.0
             capm_return = item.get("FixedYield", 0.0)
             total_expected = capm_return
         else:
-            # For gold/silver, use realized price CAGR as the modelling anchor.
+            # Gold/silver: realised price CAGR is the modelling anchor.
+            div_yield = 0.0
             capm_return = actual_cagr
             total_expected = actual_cagr
 
         rec.update({
-            "LivePrice": latest_px,
-            "PriceDate": price_date,
-            "Actual_CAGR": actual_cagr,
-            "Beta": beta,
-            "Volatility": vol,
-            "DivYield": div_yield,
-            "CAPM_Return": capm_return,
-            "Total_Expected_Return": total_expected,
-            "MarketCapCr": market_cap_cr,
+            "Actual_CAGR": actual_cagr, "Beta": beta, "Volatility": vol,
+            "DivYield": div_yield, "CAPM_Return": capm_return,
+            "Total_Expected_Return": total_expected, "AnalysisOK": True,
         })
         records.append(rec)
 
-    return pd.DataFrame(records), weekly_returns
+    return add_return_decomposition(pd.DataFrame(records)), weekly_returns
 
 
 def _annualized_risk_vector(out, returns_df):
@@ -846,7 +673,7 @@ def _annualized_risk_vector(out, returns_df):
     risks = []
     for _, row in out.iterrows():
         ticker = row["Ticker"]
-        if ticker == "GSEC2029":
+        if ticker == GSEC_TICKER:
             risks.append(0.03)
         elif ticker in returns_df.columns:
             s = returns_df[ticker].dropna()
@@ -856,38 +683,11 @@ def _annualized_risk_vector(out, returns_df):
     return np.clip(np.asarray(risks, dtype=float), 0.02, 1.50)
 
 
-def apply_entry_prices_asof(df_master, daily_prices_df, valuation_date):
+def build_persona_weights(df_analysis, persona_name, returns_df):
     """
-    Use one consistent investment-date price for the initial units.
-    This prevents a false day-one P&L caused by comparing weekly-series
-    prices with daily-series prices.
-    """
-    out = df_master.copy()
-    entry_prices = []
-
-    for _, row in out.iterrows():
-        t = row["Ticker"]
-        if t == "GSEC2029":
-            entry_prices.append(100.0)
-            continue
-
-        if t in daily_prices_df.columns:
-            s = asof_series(daily_prices_df[t], valuation_date)
-            if not s.empty:
-                entry_prices.append(float(s.iloc[-1]))
-                continue
-
-        # Fall back to the model's as-of weekly price only when daily
-        # history is unavailable.
-        entry_prices.append(row["LivePrice"])
-
-    out["EntryPrice"] = entry_prices
-    return out
-
-
-def build_persona_weights(df_master, persona_name, returns_df):
-    """
-    Desired outcome drives the weights.
+    Optimizer (UNCHANGED LOGIC). Returns a RECOMMENDED weight set only.
+    It no longer computes units or values: units belong to the locked
+    inception snapshot and are never touched by the optimizer.
 
     The investor's target corpus is converted into a required CAGR.
     The optimizer then:
@@ -896,11 +696,10 @@ def build_persona_weights(df_master, persona_name, returns_df):
       - respects persona-specific equity/debt/gold/silver guardrails.
 
     If the target is mathematically infeasible under the current assumptions,
-    the app shows the maximum-achievable-return portfolio instead of pretending
-    the target was reached.
+    the maximum-achievable-return portfolio is returned instead.
     """
     cfg = PERSONAS[persona_name]
-    out = df_master.copy()
+    out = df_analysis.copy().reset_index(drop=True)
 
     expected = pd.to_numeric(
         out["Total_Expected_Return"], errors="coerce"
@@ -916,8 +715,6 @@ def build_persona_weights(df_master, persona_name, returns_df):
 
     target_cagr = float(cfg["target_cagr"])
 
-    # Risk objective: minimize weighted standalone risk plus a small
-    # concentration penalty so the optimizer does not pile into one security.
     def objective(w):
         risk_term = np.sum((w * risks) ** 2)
         concentration_term = 0.015 * np.sum(w ** 2)
@@ -950,7 +747,6 @@ def build_persona_weights(df_master, persona_name, returns_df):
         else:
             bounds.append((cfg["min_silver"], cfg["max_silver"]))
 
-    # Start at the lower asset-class floors, with the remainder in equity.
     w0 = np.zeros(len(out), dtype=float)
     w0[eq_idx] = cfg["min_equity"] / len(eq_idx)
     w0[bond_idx] = cfg["min_debt"] / len(bond_idx)
@@ -961,7 +757,6 @@ def build_persona_weights(df_master, persona_name, returns_df):
     if remainder > 0:
         w0[eq_idx] += remainder / len(eq_idx)
 
-    # Find maximum achievable return under risk guardrails first.
     max_return_res = minimize(
         lambda w: -float(np.dot(w, expected)),
         w0,
@@ -1004,41 +799,6 @@ def build_persona_weights(df_master, persona_name, returns_df):
     out["Portfolio_Weight"] = weights
     out["Allocated_Amount"] = out["Portfolio_Weight"] * CORPUS
 
-    out["EquitySleeveWeight"] = 0.0
-    eq_total = weights[eq_idx].sum()
-    if eq_total > 0:
-        out.loc[eq_idx, "EquitySleeveWeight"] = weights[eq_idx] / eq_total
-
-    # Fix the initial holdings at the explicit 31 Aug 2026 investment-date price.
-    # Units stay fixed; later refreshes only change CurrentPrice/CurrentValue.
-    out["Units"] = np.where(
-        out["EntryPrice"].notna() & (out["EntryPrice"] > 0),
-        out["Allocated_Amount"] / out["EntryPrice"],
-        np.nan,
-    )
-    out["CurrentValue"] = out["Units"] * out["EntryPrice"]
-    out["UnrealizedPnL"] = out["CurrentValue"] - out["Allocated_Amount"]
-
-    # Return decomposition.
-    out["CapitalGainExpected"] = np.where(
-        out["Type"].eq("Equity"),
-        out["CAPM_Return"],
-        np.where(
-            out["Type"].isin(["Gold ETF", "Silver ETF"]),
-            out["Actual_CAGR"],
-            0.0,
-        ),
-    )
-    out["ExpectedIncomeYield"] = np.where(
-        out["Type"].eq("Equity"),
-        out["DivYield"],
-        np.where(
-            out["Type"].eq("Bond"),
-            out["Total_Expected_Return"],
-            0.0,
-        ),
-    )
-
     achieved_expected_return = float(np.dot(weights, expected))
     projected_value = float(CORPUS * (1.0 + achieved_expected_return) ** HORIZON_YEARS)
 
@@ -1053,8 +813,505 @@ def build_persona_weights(df_master, persona_name, returns_df):
         "max_achievable_return": max_achievable_return,
         "solver_status": solver_status,
     }
-
     return out, meta
+
+
+# ============================================================
+# 5b. INCEPTION SNAPSHOT (the ORIGINAL ₹1 Cr investment)
+# ============================================================
+def validate_snapshot(snap):
+    """Return a list of problems (empty list = snapshot is valid)."""
+    problems = []
+    try:
+        if snap.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+            problems.append(f"Unsupported schema_version {snap.get('schema_version')!r}.")
+        if pd.Timestamp(snap["investment_date"]) != INVESTMENT_DATE:
+            problems.append(
+                f"Snapshot investment_date {snap['investment_date']} != {INVESTMENT_DATE.date()}."
+            )
+        if abs(float(snap["corpus"]) - CORPUS) > 0.5:
+            problems.append(f"Snapshot corpus {snap['corpus']} != {CORPUS}.")
+
+        rows = snap["holdings"]
+        tickers = [r["Ticker"] for r in rows]
+        if len(tickers) != len(set(tickers)):
+            problems.append("Duplicate tickers in snapshot.")
+        if set(tickers) != set(ALL_TICKERS):
+            problems.append(
+                "Snapshot instruments do not match the 15-instrument universe "
+                f"(missing: {sorted(set(ALL_TICKERS) - set(tickers))}, "
+                f"unexpected: {sorted(set(tickers) - set(ALL_TICKERS))})."
+            )
+
+        total_w, total_alloc = 0.0, 0.0
+        for r in rows:
+            t = r["Ticker"]
+            w = float(r["Portfolio_Weight"])
+            alloc = float(r["Allocated_Amount"])
+            price = float(r["EntryPrice"])
+            units = float(r["Units"])
+            d = pd.Timestamp(r["EntryPriceDate"])
+            if not (np.isfinite(w) and w >= 0):
+                problems.append(f"{t}: invalid weight {w}.")
+            if not (np.isfinite(price) and price > 0):
+                problems.append(f"{t}: invalid entry price {price}.")
+            if not (np.isfinite(units) and units > 0):
+                problems.append(f"{t}: invalid units {units}.")
+            if d > INVESTMENT_DATE:
+                problems.append(f"{t}: entry price date {d.date()} is after the investment date.")
+            if abs(w * CORPUS - alloc) > 1.0:
+                problems.append(f"{t}: allocation does not equal weight × corpus.")
+            if abs(units * price - alloc) > max(1.0, 1e-6 * abs(alloc)):
+                problems.append(f"{t}: units × entry price does not reconcile to the allocation.")
+            total_w += w
+            total_alloc += alloc
+        if abs(total_w - 1.0) > 1e-6:
+            problems.append(f"Weights sum to {total_w:.8f}, not 1.")
+        if abs(total_alloc - CORPUS) > 1.0:
+            problems.append(f"Allocations sum to ₹{total_alloc:,.2f}, not ₹{CORPUS:,}.")
+    except Exception as exc:
+        problems.append(f"Snapshot is malformed: {exc}")
+    return problems
+
+
+def create_inception_snapshot(close_df, adj_df, div_map):
+    """
+    Establish the original portfolio from data dated on/before INVESTMENT_DATE.
+    Returns (snapshot_dict, []) or (None, [problems]). Nothing is created unless
+    EVERY instrument has a verified entry price and a complete analysis.
+    """
+    problems = []
+    entry_df = select_entry_prices(close_df, INVESTMENT_DATE, ALL_TICKERS)
+    for _, r in entry_df.iterrows():
+        if r["EntryStatus"] not in ("OK", GSEC_STATUS):
+            problems.append(f"{r['Ticker']}: entry price {r['EntryStatus']}.")
+
+    df_an, wk = analyze_instruments(
+        close_df, adj_df, div_map, INVESTMENT_DATE,
+        INCEPTION_LOOKBACK_YRS, INCEPTION_RF, INCEPTION_RM,
+    )
+    for _, r in df_an.iterrows():
+        if not bool(r["AnalysisOK"]):
+            problems.append(f"{r['Ticker']}: no usable price history as of {INVESTMENT_DATE.date()}.")
+    for t in EQUITY_TICKERS:
+        if div_map.get(t) is None:
+            problems.append(f"{t}: dividend history could not be retrieved.")
+    if problems:
+        return None, problems
+
+    try:
+        reco, meta = build_persona_weights(df_an, INCEPTION_PERSONA, wk)
+    except Exception as exc:
+        return None, [f"Optimizer failed while establishing the original portfolio: {exc}"]
+
+    merged = entry_df.merge(
+        reco[["Ticker", "Portfolio_Weight", "Allocated_Amount"]], on="Ticker", how="left"
+    )
+    merged["Units"] = merged["Allocated_Amount"] / merged["EntryPrice"]
+    name_map = {i["Ticker"]: i["Name"] for i in INSTRUMENTS_MASTER}
+    type_map = {i["Ticker"]: i["Type"] for i in INSTRUMENTS_MASTER}
+
+    holdings = []
+    for _, r in merged.iterrows():
+        holdings.append({
+            "Ticker": r["Ticker"],
+            "Name": name_map[r["Ticker"]],
+            "Type": type_map[r["Ticker"]],
+            "Portfolio_Weight": float(r["Portfolio_Weight"]),
+            "Allocated_Amount": float(r["Allocated_Amount"]),
+            "EntryPrice": float(r["EntryPrice"]),
+            "EntryPriceDate": pd.Timestamp(r["EntryPriceDate"]).date().isoformat(),
+            "EntryStatus": str(r["EntryStatus"]),
+            "Units": float(r["Units"]),
+        })
+
+    snap = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "investment_date": INVESTMENT_DATE.date().isoformat(),
+        "corpus": CORPUS,
+        "persona": INCEPTION_PERSONA,
+        "lookback_yrs": INCEPTION_LOOKBACK_YRS,
+        "rf_rate": INCEPTION_RF,
+        "mkt_return": INCEPTION_RM,
+        "optimizer_status": meta["solver_status"],
+        "holdings": holdings,
+    }
+    snap_problems = validate_snapshot(snap)
+    if snap_problems:
+        return None, snap_problems
+    return snap, []
+
+
+def snapshot_to_df(snap):
+    h = pd.DataFrame(snap["holdings"])
+    h["EntryPriceDate"] = pd.to_datetime(h["EntryPriceDate"])
+    meta = pd.DataFrame(INSTRUMENTS_MASTER)[["Ticker", "Name", "Sector", "CapCategory", "Type"]]
+    return meta.merge(
+        h[["Ticker", "Portfolio_Weight", "Allocated_Amount", "EntryPrice",
+           "EntryPriceDate", "EntryStatus", "Units"]],
+        on="Ticker", how="left", validate="one_to_one",
+    )
+
+
+def load_inception_snapshot():
+    """
+    Returns (snapshot | None, kind, problems).
+      kind 'repo'     - inception_holdings.json committed next to this file (permanent)
+      kind 'autosave' - best-effort local copy (lost when the Streamlit container restarts)
+    An existing-but-invalid file is reported, never silently replaced.
+    """
+    for path, kind in ((SNAPSHOT_PATH, "repo"), (AUTOSAVE_PATH, "autosave")):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    snap = json.load(fh)
+            except Exception as exc:
+                return None, kind, [f"Could not read {os.path.basename(path)}: {exc}"]
+            return snap, kind, validate_snapshot(snap)
+    return None, None, []
+
+
+def save_snapshot_file(snap, path):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# 5c. CURRENT VALUATION
+# ============================================================
+def mark_to_market(df, close_df, as_of_date):
+    """
+    Value the ORIGINAL units at the latest valid price on or before `as_of_date`.
+    Records the price date and a status per instrument. Missing prices are
+    left as NaN and flagged - they are never replaced with entry/other prices.
+    """
+    out = df.copy()
+    cur_p, cur_d, prev_p, status = [], [], [], []
+    for _, r in out.iterrows():
+        t = r["Ticker"]
+        if t == GSEC_TICKER:
+            cur_p.append(GSEC_PAR_PRICE)
+            cur_d.append(pd.Timestamp(as_of_date))
+            prev_p.append(GSEC_PAR_PRICE)
+            status.append(GSEC_STATUS)
+            continue
+        s = asof_series(close_df[t], as_of_date) if t in close_df.columns else pd.Series(dtype=float)
+        if s.empty:
+            cur_p.append(np.nan); cur_d.append(pd.NaT); prev_p.append(np.nan); status.append("MISSING")
+            continue
+        p = float(s.iloc[-1])
+        d = pd.Timestamp(s.index[-1])
+        if (not np.isfinite(p)) or p <= 0:
+            cur_p.append(np.nan); cur_d.append(d); prev_p.append(np.nan); status.append("INVALID")
+            continue
+        lag = (pd.Timestamp(as_of_date) - d).days
+        cur_p.append(p)
+        cur_d.append(d)
+        prev_p.append(float(s.iloc[-2]) if len(s) >= 2 else p)
+        status.append("OK" if lag <= CURRENT_STALE_DAYS else f"STALE ({lag} days old)")
+
+    out["CurrentPrice"] = cur_p
+    out["PriceDate"] = pd.to_datetime(pd.Series(cur_d, index=out.index))
+    out["PreviousClose"] = prev_p
+    out["PriceStatus"] = status
+
+    out["CurrentValue"] = out["Units"] * out["CurrentPrice"]
+    out["DailyPriceChange"] = out["CurrentPrice"] - out["PreviousClose"]
+    out["DailyPriceChangePct"] = np.where(
+        out["PreviousClose"].notna() & (out["PreviousClose"] != 0),
+        out["DailyPriceChange"] / out["PreviousClose"],
+        0.0,
+    )
+
+    days_held = max((pd.Timestamp(as_of_date) - INVESTMENT_DATE).days, 0)
+    if GSEC_ACCRUE_COUPON:
+        out["AccruedInterest"] = np.where(
+            out["Ticker"].eq(GSEC_TICKER),
+            out["Allocated_Amount"] * GSEC_COUPON_RATE * days_held / 365.0,
+            0.0,
+        )
+    else:
+        out["AccruedInterest"] = 0.0
+    return out
+
+
+def valuation_issues(df):
+    missing = df.loc[df["PriceStatus"].isin(["MISSING", "INVALID"]), "Name"].tolist()
+    stale = df.loc[df["PriceStatus"].astype(str).str.startswith("STALE"), "Name"].tolist()
+    return missing, stale
+
+
+# ============================================================
+# 5d. DIVIDENDS (NSE primary, Yahoo fallback)
+# ============================================================
+def _nse_session():
+    """Create a browser-like NSE session for official public API calls."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+    try:
+        session.get("https://www.nseindia.com/", timeout=15)
+    except Exception:
+        pass
+    return session
+
+
+def _parse_dividend_amount(purpose):
+    """Extract dividend per share from NSE's purpose text."""
+    text = str(purpose or "")
+    patterns = [
+        r"Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Interim Dividend\s*-\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Interim Dividend\s*-\s*Re\.?\s*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+        r"Dividend[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*Per Share",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return float(m.group(1))
+    return np.nan
+
+
+def _normalize_nse_date(value):
+    return pd.to_datetime(value, errors="coerce", dayfirst=False)
+
+
+DIVIDEND_COLUMNS = [
+    "Symbol", "NSE Purpose", "Dividend / Share", "Ex-Date", "Record Date",
+    "NSE Announcement Date", "NSE Announcement Subject", "Source",
+]
+DIVIDEND_DATE_COLUMNS = ["Ex-Date", "Record Date", "NSE Announcement Date"]
+
+
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def fetch_nse_dividends(symbols, start_date, end_date):
+    """
+    PRIMARY dividend feed: NSE public corporate-actions + corporate-announcements APIs.
+
+    Only events with an ex-date STRICTLY AFTER start_date (the investment date)
+    are kept: shares bought at the investment-date close are not entitled to a
+    dividend whose ex-date is that same day.
+    """
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+    session = _nse_session()
+
+    rows = []
+
+    for symbol in symbols:
+        actions_url = (
+            "https://www.nseindia.com/api/corporates-corporateActions"
+            f"?index=equities&symbol={symbol}"
+        )
+        actions = []
+        try:
+            r = session.get(actions_url, timeout=15)
+            r.raise_for_status()
+            payload = r.json()
+            if isinstance(payload, dict):
+                actions = payload.get("data", payload.get("corporateActions", []))
+            elif isinstance(payload, list):
+                actions = payload
+        except Exception:
+            actions = []
+
+        announcements_url = (
+            "https://www.nseindia.com/api/corporate-announcements"
+            f"?index=equities&symbol={symbol}"
+        )
+        announcements = []
+        try:
+            r = session.get(announcements_url, timeout=15)
+            r.raise_for_status()
+            payload = r.json()
+            if isinstance(payload, dict):
+                announcements = payload.get("data", [])
+            elif isinstance(payload, list):
+                announcements = payload
+        except Exception:
+            announcements = []
+
+        dividend_actions = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+
+            purpose = action.get("subject", action.get("purpose", ""))
+            if "DIVIDEND" not in str(purpose).upper():
+                continue
+
+            ex_date = _normalize_nse_date(action.get("exDate", action.get("ex_date")))
+            record_date = _normalize_nse_date(
+                action.get("recDate", action.get("recordDate", action.get("record_date")))
+            )
+            amount = _parse_dividend_amount(purpose)
+
+            if pd.isna(ex_date) and pd.isna(record_date):
+                continue
+
+            action_date = ex_date if pd.notna(ex_date) else record_date
+            # strictly after the investment date; not beyond the fetch horizon
+            if pd.notna(action_date) and (action_date <= start_date or action_date > end_date):
+                continue
+
+            dividend_actions.append({
+                "Symbol": symbol,
+                "NSE Purpose": purpose,
+                "Dividend / Share": amount,
+                "Ex-Date": ex_date,
+                "Record Date": record_date,
+                "Source": "NSE Corporate Actions API",
+            })
+
+        for row in dividend_actions:
+            relevant_ann = []
+            for ann in announcements:
+                if not isinstance(ann, dict):
+                    continue
+                subject = str(ann.get("desc", ann.get("subject", "")))
+                if "DIVIDEND" not in subject.upper():
+                    continue
+
+                ann_date = _normalize_nse_date(
+                    ann.get("an_dt", ann.get("sort_date", ann.get("broadcastDate")))
+                )
+                if pd.notna(ann_date):
+                    if start_date - pd.Timedelta(days=30) <= ann_date <= end_date:
+                        relevant_ann.append((ann_date, subject))
+
+            if relevant_ann:
+                ex_date = row["Ex-Date"]
+                if pd.notna(ex_date):
+                    prior = [x for x in relevant_ann if x[0] <= ex_date]
+                    chosen = max(prior, key=lambda x: x[0]) if prior else min(
+                        relevant_ann, key=lambda x: abs((x[0] - ex_date).days)
+                    )
+                else:
+                    chosen = max(relevant_ann, key=lambda x: x[0])
+                row["NSE Announcement Date"] = chosen[0]
+                row["NSE Announcement Subject"] = chosen[1]
+            else:
+                row["NSE Announcement Date"] = pd.NaT
+                row["NSE Announcement Subject"] = ""
+
+        rows.extend(dividend_actions)
+
+    if not rows:
+        return pd.DataFrame(columns=DIVIDEND_COLUMNS)
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["Symbol", "Ex-Date", "Dividend / Share"], keep="last")
+    return df.sort_values(["Symbol", "Ex-Date"], ascending=[True, False])
+
+
+@st.cache_data(ttl=20 * 60 * 60, show_spinner=False)
+def fetch_yahoo_dividends_fallback(symbols, start_date, end_date):
+    """Fallback only for symbols where NSE does not return an action."""
+    rows = []
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    for symbol in symbols:
+        ticker = symbol + ".NS"
+        try:
+            div = yf.Ticker(ticker).dividends
+            div.index = pd.to_datetime(div.index)
+            if getattr(div.index, "tz", None) is not None:
+                div.index = div.index.tz_localize(None)
+            div.index = div.index.normalize()
+            # strictly after the investment date
+            div = div[(div.index > start_date) & (div.index <= end_date)]
+        except Exception:
+            div = pd.Series(dtype=float)
+
+        for event_date, amount in div.items():
+            rows.append({
+                "Symbol": symbol,
+                "NSE Purpose": "Yahoo Finance dividend action",
+                "Dividend / Share": float(amount),
+                "Ex-Date": pd.Timestamp(event_date),
+                "Record Date": pd.NaT,
+                "NSE Announcement Date": pd.NaT,
+                "NSE Announcement Subject": "",
+                "Source": "Yahoo Finance fallback",
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=DIVIDEND_COLUMNS)
+    return pd.DataFrame(rows)
+
+
+def build_dividend_tracker(units_by_ticker, investment_date, fetch_end, as_of):
+    """
+    One consolidated, auditable dividend ledger.
+
+    Events are attributed using the ORIGINAL units. An event counts toward
+    portfolio return only when its ex-date is after the investment date and on
+    or before `as_of` (the current valuation date); later ex-dates are listed
+    as "Declared / upcoming" and are NOT added to value.
+    """
+    symbols = [t.replace(".NS", "") for t in EQUITY_TICKERS]
+
+    nse_df = fetch_nse_dividends(symbols, investment_date, fetch_end)
+
+    covered = set(nse_df["Symbol"].dropna().astype(str)) if not nse_df.empty else set()
+    missing_symbols = [s for s in symbols if s not in covered]
+    yahoo_df = fetch_yahoo_dividends_fallback(missing_symbols, investment_date, fetch_end)
+
+    if nse_df.empty:
+        tracker = yahoo_df.copy()
+    elif yahoo_df.empty:
+        tracker = nse_df.copy()
+    else:
+        tracker = pd.concat([nse_df, yahoo_df], ignore_index=True)
+
+    for col in DIVIDEND_COLUMNS:
+        if col not in tracker.columns:
+            if col == "Dividend / Share":
+                tracker[col] = np.nan
+            elif col in DIVIDEND_DATE_COLUMNS:
+                tracker[col] = pd.NaT
+            else:
+                tracker[col] = ""
+
+    ticker_by_symbol = {t.replace(".NS", ""): t for t in ALL_TICKERS}
+    name_by_ticker = {i["Ticker"]: i["Name"] for i in INSTRUMENTS_MASTER}
+    tracker["Ticker"] = tracker["Symbol"].map(ticker_by_symbol)
+    tracker["Company"] = tracker["Ticker"].map(name_by_ticker)
+    tracker["Units"] = tracker["Ticker"].map(units_by_ticker)
+    tracker["Dividend Entitlement"] = (
+        pd.to_numeric(tracker["Dividend / Share"], errors="coerce")
+        * pd.to_numeric(tracker["Units"], errors="coerce")
+    )
+
+    ex = pd.to_datetime(tracker["Ex-Date"], errors="coerce")
+    tracker["Status"] = np.where(
+        ex.notna() & (ex > pd.Timestamp(investment_date)) & (ex <= pd.Timestamp(as_of)),
+        STATUS_ENTITLED,
+        STATUS_UPCOMING,
+    )
+    tracker["NSE Verified"] = np.where(
+        tracker["Source"].astype(str).str.startswith("NSE"), "Yes", "Fallback",
+    )
+
+    return tracker.sort_values(
+        ["Ex-Date", "Company"], ascending=[False, True], na_position="last"
+    ).reset_index(drop=True)
 
 
 # ============================================================
@@ -1070,14 +1327,14 @@ with st.sidebar:
             "Persona target",
             list(PERSONAS.keys()),
             index=1,
-            help="The target is the investor's desired 3-year outcome. It does not directly force portfolio weights.",
+            help="The target is the investor's desired 3-year outcome. It drives the target comparison and the CURRENT recommendation; it never changes the original 31 Aug 2026 holdings.",
         )
         lookback_yrs = st.slider(
             "Historical lookback (years)",
             min_value=1,
             max_value=5,
             value=5,
-            help="Used for historical CAGR/volatility inputs and return context.",
+            help="Used for the CURRENT beta/volatility/return analysis and recommendation. The original holdings were set with a fixed 5-year lookback ending 31 Aug 2026.",
         )
 
     with st.expander("CAPM Parameters", expanded=True):
@@ -1107,158 +1364,192 @@ with st.sidebar:
     )
     st.caption("Investment date: 31 Aug 2026 · " + refresh_note)
     st.caption("Dividend source priority: NSE Corporate Actions → Yahoo fallback.")
-    st.caption("Persona targets determine the required CAGR constraint; the optimizer then minimizes risk within persona-specific allocation guardrails.")
+    st.caption("Original holdings are locked at inception. Persona, lookback, Rf and Rm only update the current recommendation and modelled returns.")
 
 # ============================================================
 # 7. RUN DATA ENGINE
 # ============================================================
+# 7a. Load the locked inception snapshot (if one exists).
+snapshot, snapshot_kind, snapshot_problems = load_inception_snapshot()
+if snapshot_problems:
+    st.error(
+        "The inception snapshot file failed validation. The dashboard has stopped "
+        "instead of silently replacing your original holdings."
+    )
+    for _problem in snapshot_problems:
+        st.write("- " + _problem)
+    st.caption(
+        "Fix the file, or delete it deliberately if you really want the original "
+        "portfolio to be rebuilt from 31 Aug 2026 data."
+    )
+    st.stop()
+
+# 7b. Market data.
 try:
     with st.spinner("Downloading market data & computing risk/return metrics..."):
-        prices_df = fetch_live_market_data(lookback_yrs)
-        daily_prices_df = fetch_daily_prices()
-        # The portfolio's displayed valuation date is the latest actual daily
-        # market-data date, not the server's calendar date.
-        MARKET_AS_OF_DATE = (
-            pd.Timestamp(daily_prices_df.index.max()).normalize()
-            if not daily_prices_df.empty else pd.NaT
-        )
-        df_master_raw, returns_df = analyze_live_performance(prices_df, rf_rate, mkt_return)
+        close_df, adj_df = fetch_price_history()
+        div_map = get_dividend_map()
+        market_caps = get_market_caps()
+        _holding_cols = [c for c in close_df.columns if c != "^NSEI"]
+        if not _holding_cols:
+            raise RuntimeError("No instrument prices were returned.")
+        latest_market_date = pd.Timestamp(close_df[_holding_cols].dropna(how="all").index.max())
+except Exception as e:
+    st.error("Error downloading market data.")
+    st.exception(e)
+    st.stop()
 
-        # Make the investment-date price explicit and consistent across
-        # all subsequent calculations.
-        df_master_raw = apply_entry_prices_asof(
-            df_master_raw,
-            daily_prices_df,
-            VALUATION_DATE,
-        )
+if latest_market_date < INVESTMENT_DATE:
+    st.error(
+        f"Market data currently ends on {latest_market_date.strftime('%d %b %Y')}, before the "
+        f"investment date ({INVESTMENT_DATE.strftime('%d %b %Y')}). The simulated investment "
+        f"cannot be established yet."
+    )
+    st.stop()
 
-        # Re-use the explicit entry price during unit calculation.
-        # Guarantee a MarketCapCr field so the Daily Market Movement table
-        # never breaks when an instrument does not have a meaningful market cap.
-        if "MarketCapCr" not in df_master_raw.columns:
-            df_master_raw["MarketCapCr"] = np.nan
-
-        df_master, optimization_meta = build_persona_weights(
-            df_master_raw,
-            selected_persona,
-            returns_df,
+# 7c. First run only: establish the original portfolio from data dated on or
+# before 31 Aug 2026. Nothing is created unless every instrument has a verified
+# entry price and complete analysis.
+if snapshot is None:
+    snapshot, _new_problems = create_inception_snapshot(close_df, adj_df, div_map)
+    if _new_problems:
+        st.error(
+            "The original 31 Aug 2026 portfolio could not be established safely, so nothing "
+            "was created. Fix the issue below (or press Refresh) and reload."
         )
+        for _problem in _new_problems:
+            st.write("- " + _problem)
+        st.stop()
+    snapshot_kind = "autosave" if save_snapshot_file(snapshot, AUTOSAVE_PATH) else "provisional"
+
+# 7d. Current analysis + valuation of the ORIGINAL units.
+try:
+    holdings_df = snapshot_to_df(snapshot)
+    df_cur, returns_df = analyze_instruments(
+        close_df, adj_df, div_map, latest_market_date, lookback_yrs, rf_rate, mkt_return,
+    )
+    _analysis_cols = [
+        "Ticker", "Beta", "Volatility", "Actual_CAGR", "DivYield", "CAPM_Return",
+        "Total_Expected_Return", "CapitalGainExpected", "ExpectedIncomeYield", "AnalysisOK",
+    ]
+    df_master = holdings_df.merge(
+        df_cur[_analysis_cols], on="Ticker", how="left", validate="one_to_one"
+    )
+    df_master["MarketCapCr"] = df_master["Ticker"].map(market_caps)
+    df_master = mark_to_market(df_master, close_df, latest_market_date)
 except Exception as e:
     st.error("Error executing market analysis engine.")
     st.exception(e)
     st.stop()
 
+data_health_df = pd.DataFrame({
+    "Instrument": df_master["Name"],
+    "Entry price date": df_master["EntryPriceDate"].dt.strftime("%d %b %Y"),
+    "Entry price (₹)": df_master["EntryPrice"],
+    "Current price date": df_master["PriceDate"].dt.strftime("%d %b %Y"),
+    "Current price (₹)": df_master["CurrentPrice"],
+    "Entry price status": df_master["EntryStatus"],
+    "Current price status": df_master["PriceStatus"],
+})
+
+missing_prices, stale_prices = valuation_issues(df_master)
+if missing_prices:
+    st.error(
+        "Valuation stopped: no valid current price for " + ", ".join(missing_prices) + ". "
+        "Showing a total without these holdings would misstate the portfolio value and P&L, "
+        "and substituting the entry price would hide real gains/losses. "
+        "Press Refresh, or check the ticker on Yahoo Finance."
+    )
+    st.dataframe(data_health_df, use_container_width=True, hide_index=True)
+    st.stop()
+if stale_prices:
+    st.warning(
+        "These holdings have a last traded price older than "
+        f"{CURRENT_STALE_DAYS} days and are valued at that last price: "
+        + ", ".join(stale_prices) + "."
+    )
+
 persona_cfg = PERSONAS[selected_persona]
 target_cagr = persona_cfg["target_cagr"]
 
+# Current recommendation (separate from the original holdings; never used for valuation).
+reco_df, optimization_meta, reco_error = None, None, ""
+try:
+    reco_df, optimization_meta = build_persona_weights(df_cur, selected_persona, returns_df)
+except Exception as e:
+    reco_error = str(e)
+
 # ============================================================
-# 8. PORTFOLIO LIVE MARK-TO-MARKET + DIVIDENDS
+# 8. DIVIDENDS + PORTFOLIO VALUE
 # ============================================================
-# Re-mark the fixed 31 Aug 2026 holdings to the latest available price.
-latest_prices = {}
-previous_prices = {}
-
-for _, row in df_master.iterrows():
-    ticker = row["Ticker"]
-    if ticker == "GSEC2029":
-        latest_prices[ticker] = 100.0
-        previous_prices[ticker] = 100.0
-        continue
-
-    if ticker in daily_prices_df.columns:
-        s = daily_prices_df[ticker].dropna()
-        if len(s) >= 1:
-            latest_prices[ticker] = float(s.iloc[-1])
-        if len(s) >= 2:
-            previous_prices[ticker] = float(s.iloc[-2])
-
-df_master["CurrentPrice"] = df_master.apply(
-    lambda r: latest_prices.get(r["Ticker"], np.nan), axis=1
-)
-missing_current_prices = df_master.loc[
-    df_master["CurrentPrice"].isna(), "Name"
-].astype(str).tolist()
-if missing_current_prices:
-    st.warning(
-        "Latest daily market prices are unavailable for: "
-        + ", ".join(missing_current_prices)
-        + ". Their current values are shown as unavailable rather than being"
-          " incorrectly replaced with their 31 Aug 2026 entry prices. Refresh"
-          " market data before relying on the portfolio total."
-    )
-
-# On the investment date itself, current price and entry price must be identical
-# so the portfolio cannot show an artificial day-one gain/loss.
-if TODAY <= VALUATION_DATE:
-    df_master["CurrentPrice"] = df_master["EntryPrice"]
-df_master["PreviousClose"] = df_master.apply(
-    lambda r: previous_prices.get(r["Ticker"], r["CurrentPrice"]), axis=1
-)
-
-df_master["CurrentValue"] = df_master["Units"] * df_master["CurrentPrice"]
-df_master["DailyPriceChange"] = df_master["CurrentPrice"] - df_master["PreviousClose"]
-df_master["DailyPriceChangePct"] = np.where(
-    df_master["PreviousClose"].notna() & (df_master["PreviousClose"] != 0),
-    df_master["DailyPriceChange"] / df_master["PreviousClose"],
-    0.0,
-)
-
-# Dividend tracker — official NSE API first, Yahoo fallback only for uncovered symbols.
 units_by_ticker = df_master.set_index("Ticker")["Units"].to_dict()
-div_hist = build_dividend_tracker(
-    units_by_ticker,
-    pd.Timestamp("2026-08-31"),
-    TODAY,
-)
+dividend_fetch_end = max(TODAY, latest_market_date) + pd.Timedelta(days=90)
+dividend_error = ""
+try:
+    div_hist = build_dividend_tracker(
+        units_by_ticker, INVESTMENT_DATE, dividend_fetch_end, latest_market_date,
+    )
+except Exception as e:
+    dividend_error = str(e)
+    div_hist = pd.DataFrame(columns=DIVIDEND_COLUMNS + [
+        "Ticker", "Company", "Units", "Dividend Entitlement", "Status", "NSE Verified",
+    ])
 
+_counted = div_hist["Status"].eq(STATUS_ENTITLED)
 dividend_entitlement = float(
-    pd.to_numeric(
-        div_hist.get("Dividend Entitlement", pd.Series(dtype=float)),
-        errors="coerce"
-    ).fillna(0).sum()
+    pd.to_numeric(div_hist.loc[_counted, "Dividend Entitlement"], errors="coerce").fillna(0).sum()
+)
+unparsed_dividends = int(
+    pd.to_numeric(div_hist["Dividend / Share"], errors="coerce").isna().sum()
 )
 
 df_master["DividendEntitlement"] = 0.0
-if not div_hist.empty:
-    dividend_by_ticker = div_hist.groupby("Ticker")["Dividend Entitlement"].sum()
+if _counted.any():
+    dividend_by_ticker = div_hist.loc[_counted].groupby("Ticker")["Dividend Entitlement"].sum()
     df_master["DividendEntitlement"] = (
         df_master["Ticker"].map(dividend_by_ticker).fillna(0.0)
     )
 
-# For total-return accounting, entitled dividends are included because the
-# investor has earned the economic dividend after the ex-date. We separately
-# label them as "entitlement" rather than falsely claiming a payment receipt.
+# Total value = ORIGINAL units x latest valid price + dividends whose ex-date has
+# passed + modelled G-Sec accrued coupon.
 df_master["TotalCurrentValue"] = (
-    df_master["CurrentValue"] + df_master["DividendEntitlement"]
+    df_master["CurrentValue"] + df_master["DividendEntitlement"] + df_master["AccruedInterest"]
 )
-df_master["TotalInvestmentGain"] = (
-    df_master["TotalCurrentValue"] - df_master["Allocated_Amount"]
-)
+df_master["UnrealizedPnL"] = df_master["CurrentValue"] - df_master["Allocated_Amount"]
+df_master["TotalInvestmentGain"] = df_master["TotalCurrentValue"] - df_master["Allocated_Amount"]
 df_master["TotalInvestmentGainPct"] = np.where(
     df_master["Allocated_Amount"] != 0,
     df_master["TotalInvestmentGain"] / df_master["Allocated_Amount"],
     0.0,
 )
+df_master["CurrentWeight"] = (
+    df_master["TotalCurrentValue"] / df_master["TotalCurrentValue"].sum()
+)
 
 # ============================================================
 # 9. PORTFOLIO METRICS
 # ============================================================
-current_portfolio_value = float(df_master["TotalCurrentValue"].sum(skipna=True))
-invested_capital = float(df_master["Allocated_Amount"].sum())
+current_portfolio_value = float(df_master["TotalCurrentValue"].sum())
+invested_capital = float(CORPUS)
 current_pnl = current_portfolio_value - invested_capital
-current_pnl_pct = current_pnl / invested_capital if invested_capital else 0.0
+current_pnl_pct = current_pnl / invested_capital
 
 # ------------------------------------------------------------
-# LIVE TARGET FEASIBILITY
+# DATES: investment date (fixed) / current valuation date (latest market data)
+# / target date (fixed) / remaining horizon
 # ------------------------------------------------------------
-# The target corpus remains fixed. Market movements change the portfolio's
-# current value, so the CAGR required from TODAY to the target date changes.
-target_date = VALUATION_DATE + pd.DateOffset(years=HORIZON_YEARS)
-horizon_as_of_date = MARKET_AS_OF_DATE if pd.notna(MARKET_AS_OF_DATE) else TODAY
-remaining_days = max((target_date.normalize() - horizon_as_of_date).days, 0)
+target_date = TARGET_DATE
+remaining_days = max((TARGET_DATE - latest_market_date).days, 0)
 remaining_years = remaining_days / 365.25
+elapsed_years_now = min(
+    max((latest_market_date - INVESTMENT_DATE).days / 365.25, 0.0), float(HORIZON_YEARS)
+)
 
-portfolio_expected_return = optimization_meta["achieved_expected_return"]
+# Modelled return of the ACTUAL holdings: current market-value weights x current
+# expected returns (current beta / CAPM / dividend yield).
+portfolio_expected_return = float(
+    (df_master["CurrentWeight"] * df_master["Total_Expected_Return"]).sum()
+)
 
 if remaining_years > 0 and current_portfolio_value > 0:
     live_required_cagr = (
@@ -1278,9 +1569,6 @@ live_expected_end_value = (
     else current_portfolio_value
 )
 
-# This is the answer to: "How much could the portfolio actually become by
-# the target date if today's current portfolio value and today's modelled
-# return continue?"  It is distinct from the investor's fixed target.
 live_projected_gain = live_expected_end_value - current_portfolio_value
 live_projected_gain_pct = (
     live_projected_gain / current_portfolio_value
@@ -1299,36 +1587,35 @@ portfolio_realized_cagr = float(
     (df_master["Portfolio_Weight"] * df_master["Actual_CAGR"]).sum()
 )
 
-# Separate return components for the dashboard.
+# Return components (current market-value weights, so they add up to the
+# modelled return shown in the KPI row).
 equity_mask = df_master["Type"].eq("Equity")
 bond_mask = df_master["Type"].eq("Bond")
 gold_mask = df_master["Type"].eq("Gold ETF")
 silver_mask = df_master["Type"].eq("Silver ETF")
 
 equity_cap_gain = float(
-    (df_master.loc[equity_mask, "Portfolio_Weight"] * df_master.loc[equity_mask, "CapitalGainExpected"]).sum()
+    (df_master.loc[equity_mask, "CurrentWeight"] * df_master.loc[equity_mask, "CapitalGainExpected"]).sum()
 )
 equity_dividends = float(
-    (df_master.loc[equity_mask, "Portfolio_Weight"] * df_master.loc[equity_mask, "DivYield"]).sum()
+    (df_master.loc[equity_mask, "CurrentWeight"] * df_master.loc[equity_mask, "DivYield"]).sum()
 )
 bond_income = float(
-    (df_master.loc[bond_mask, "Portfolio_Weight"] * df_master.loc[bond_mask, "Total_Expected_Return"]).sum()
+    (df_master.loc[bond_mask, "CurrentWeight"] * df_master.loc[bond_mask, "Total_Expected_Return"]).sum()
 )
 gold_return = float(
-    (df_master.loc[gold_mask, "Portfolio_Weight"] * df_master.loc[gold_mask, "Total_Expected_Return"]).sum()
+    (df_master.loc[gold_mask, "CurrentWeight"] * df_master.loc[gold_mask, "Total_Expected_Return"]).sum()
 )
 silver_return = float(
-    (df_master.loc[silver_mask, "Portfolio_Weight"] * df_master.loc[silver_mask, "Total_Expected_Return"]).sum()
+    (df_master.loc[silver_mask, "CurrentWeight"] * df_master.loc[silver_mask, "Total_Expected_Return"]).sum()
 )
 
-# Inception target path remains a fixed benchmark; live target status is
-# recalculated from today's current value and remaining time.
 yrs = np.arange(0, HORIZON_YEARS + 1)
 target_path = CORPUS * ((1 + target_cagr) ** yrs)
-expected_path = CORPUS * ((1 + portfolio_expected_return) ** yrs)
-expected_final_value = optimization_meta["projected_value"]
+expected_final_value = (
+    optimization_meta["projected_value"] if optimization_meta else np.nan
+)
 
-# Capital + income breakdown based on weighted annual return contributions.
 return_breakdown = pd.DataFrame({
     "Component": [
         "Equity capital gains",
@@ -1355,12 +1642,13 @@ with hero_l:
     st.markdown(
         f"""
         <div class="hero-wrap">
-            <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {(MARKET_AS_OF_DATE.strftime("%d %b %Y") if pd.notna(MARKET_AS_OF_DATE) else "MARKET DATA UNAVAILABLE")} · INVESTED 31 AUG 2026 · {lookback_yrs}Y LOOKBACK</div>
+            <div class="hero-eyebrow">LIVE PORTFOLIO · AS OF {latest_market_date.strftime("%d %b %Y").upper()} · INVESTED {INVESTMENT_DATE.strftime("%d %b %Y").upper()} · {lookback_yrs}Y LOOKBACK</div>
             <div class="hero-title">15-Asset Allocation Terminal</div>
             <p class="hero-sub">
-                ₹1.00 Cr allocated across 11 equities, 2 bonds, Gold ETF and Silver ETF for the
-                <strong style="color:{GOLD_SOFT}">{selected_persona}</strong> investor objective.
-                The desired outcome is converted into a required CAGR and used as a minimum-return constraint; the optimizer minimizes risk subject to that target.
+                ₹1.00 Cr invested on {INVESTMENT_DATE.strftime("%d %b %Y")} across 11 equities, 2 bonds, Gold ETF and Silver ETF
+                (original holdings set under the <strong style="color:{GOLD_SOFT}">{snapshot.get("persona", INCEPTION_PERSONA)}</strong> profile and locked).
+                Target comparisons use the selected <strong style="color:{GOLD_SOFT}">{selected_persona}</strong> objective;
+                the optimizer only produces a separate, current recommendation.
             </p>
         </div>
         """,
@@ -1372,14 +1660,36 @@ with hero_r:
         f"""
         <div class="hero-wrap" style="text-align:right; height:100%;">
             <div class="hero-big-number">₹{current_portfolio_value/1e7:.2f} Cr</div>
-            <div class="hero-big-label">Current portfolio value at {(MARKET_AS_OF_DATE.strftime("%d %b %Y") if pd.notna(MARKET_AS_OF_DATE) else "market data unavailable")}</div>
+            <div class="hero-big-label">Current portfolio value at {latest_market_date.strftime("%d %b %Y")}</div>
             <div class="{"kpi-delta-pos" if current_pnl >= 0 else "kpi-delta-neg"}"
                  style="margin-top:10px; font-size:13px;">
-                P&L since 31 Aug 2026: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
+                P&amp;L since {INVESTMENT_DATE.strftime("%d %b %Y")}: ₹{current_pnl/1e5:.2f} Lakh ({current_pnl_pct:+.2%})
             </div>
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+# Snapshot status (is the original portfolio permanent yet?)
+_snapshot_created = str(snapshot.get("created_at_utc", ""))[:10]
+if snapshot_kind == "repo":
+    st.caption(
+        f"Original holdings locked from inception_holdings.json (created {_snapshot_created}; "
+        f"{snapshot.get('persona', INCEPTION_PERSONA)} profile, {snapshot.get('lookback_yrs', INCEPTION_LOOKBACK_YRS)}Y lookback). "
+        f"Sidebar inputs do not change them."
+    )
+else:
+    st.warning(
+        "Original holdings were established from 31 Aug 2026 data but are NOT permanent yet: "
+        "this server's disk is wiped whenever the app restarts or redeploys. Download the file "
+        "below and commit it to your GitHub repo root (next to Investment_Dashboard.py) as "
+        "inception_holdings.json to lock them permanently."
+    )
+    st.download_button(
+        "⬇ Download inception_holdings.json",
+        data=json.dumps(snapshot, indent=2),
+        file_name="inception_holdings.json",
+        mime="application/json",
     )
 
 # ============================================================
@@ -1417,7 +1727,7 @@ k4.markdown(
     kpi_card(
         "Current Modelled Return",
         f"{portfolio_expected_return:.2%}",
-        '<div class="kpi-delta-pos">Based on current market/risk data</div>',
+        '<div class="kpi-delta-pos">Original holdings · current market/risk data</div>',
     ),
     unsafe_allow_html=True,
 )
@@ -1430,6 +1740,17 @@ k5.markdown(
     ),
     unsafe_allow_html=True,
 )
+
+st.write("")
+st.markdown(
+    f'<div class="info-box"><strong>Investment date</strong> {INVESTMENT_DATE.strftime("%d %b %Y")} (fixed) · '
+    f'<strong>Current valuation date</strong> {latest_market_date.strftime("%d %b %Y")} (latest market data) · '
+    f'<strong>Target date</strong> {TARGET_DATE.strftime("%d %b %Y")} (fixed) · '
+    f'<strong>Remaining horizon</strong> {remaining_years:.2f} years ({remaining_days} days). '
+    f'Prices can be intraday while the market is open.</div>',
+    unsafe_allow_html=True,
+)
+st.write("")
 
 # Prominent "actual amount" projection card.
 proj_l, proj_r = st.columns([1.5, 1])
@@ -1462,28 +1783,56 @@ with proj_r:
         unsafe_allow_html=True,
     )
 
-# Reconciliation check: all instruments should sum back to the ₹1 Cr invested
-# amount at inception, before dividends or market movement.
-entry_value_check = float(df_master["Allocated_Amount"].sum())
+# Real reconciliation: ORIGINAL units x ENTRY prices must equal the ₹1 Cr invested.
+entry_value_check = float((df_master["Units"] * df_master["EntryPrice"]).sum())
+reconciliation_gap = entry_value_check - CORPUS
 st.caption(
-    f"Initial allocation total (not a unit-price reconciliation): ₹{entry_value_check/1e7:.2f} Cr allocated across "
-    f"{len(df_master)} instruments. Entry prices are sourced as of 31 Aug 2026 where data is available."
+    f"Inception reconciliation: units × entry prices = ₹{entry_value_check:,.0f} vs ₹{CORPUS:,} invested "
+    f"(difference ₹{reconciliation_gap:,.2f}) across {len(df_master)} instruments. "
+    f"Units are fixed from the {INVESTMENT_DATE.strftime('%d %b %Y')} entry prices; "
+    f"market value ₹{df_master['CurrentValue'].sum():,.0f} + dividends ₹{dividend_entitlement:,.0f} "
+    f"+ G-Sec accrued coupon ₹{df_master['AccruedInterest'].sum():,.0f} = ₹{current_portfolio_value:,.0f}."
 )
+if abs(reconciliation_gap) > 1.0:
+    st.error("Inception units × entry prices do not reconcile to ₹1 Cr. Check the snapshot file.")
+
+with st.expander("Data integrity: entry prices & current prices per instrument"):
+    st.dataframe(
+        data_health_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Entry price (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Current price (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+    )
+    st.caption(
+        "Entry price = last close on or before the investment date (never a current price). "
+        "The G-Sec has no market price feed and is carried at indicative par (₹100)"
+        + (f", accruing its {GSEC_COUPON_RATE:.2%} coupon as simple interest." if GSEC_ACCRUE_COUPON else ".")
+    )
+    if dividend_error:
+        st.warning(f"Dividend ledger could not be built ({dividend_error}); dividends are NOT included in the value.")
 
 st.write("")
 
-if optimization_meta["target_feasible"]:
+if optimization_meta is None:
+    st.info(
+        "The current recommendation could not be computed "
+        f"({reco_error}). Portfolio valuation above is unaffected."
+    )
+elif optimization_meta["target_feasible"]:
     st.success(
-        f"Target-driven allocation: the {selected_persona} objective of "
+        f"Current recommendation: the {selected_persona} objective of "
         f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr is feasible under the current "
-        f"return assumptions and risk guardrails. The optimizer minimizes risk while "
-        f"maintaining at least {target_cagr:.2%} expected annual return."
+        f"return assumptions and risk guardrails. A fresh optimization would minimize risk while "
+        f"maintaining at least {target_cagr:.2%} expected annual return (see the Recommendation tab)."
     )
 else:
     st.warning(
-        f"The {selected_persona} target of ₹{persona_cfg['target_corpus']/1e7:.2f} Cr "
-        f"is not feasible under the current assumptions and risk guardrails. "
-        f"The model therefore shows the maximum achievable outcome of "
+        f"Current recommendation: the {selected_persona} target of ₹{persona_cfg['target_corpus']/1e7:.2f} Cr "
+        f"is not feasible from inception under the current assumptions and risk guardrails. "
+        f"A fresh optimization would show a maximum achievable outcome of "
         f"₹{expected_final_value/1e7:.2f} Cr."
     )
 
@@ -1549,7 +1898,7 @@ selected_row = df_master.loc[df_master["Name"].eq(selected_instrument)].iloc[0]
 
 i1, i2, i3, i4 = st.columns(4)
 i1.metric("Current Price", f"₹{selected_row['CurrentPrice']:,.2f}" if pd.notna(selected_row["CurrentPrice"]) else "N/A")
-i2.metric("Portfolio Weight", f"{selected_row['Portfolio_Weight']:.2%}")
+i2.metric("Original Weight", f"{selected_row['Portfolio_Weight']:.2%}")
 i3.metric("Allocated", f"₹{selected_row['Allocated_Amount']/1e5:.2f} L")
 i4.metric("Current Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
 
@@ -1563,12 +1912,14 @@ with detail_left:
             if pd.notna(selected_row["MarketCapCr"]) else "N/A"
         ),
         "Sector / Exposure": selected_row["Sector"],
-        "Entry Price (31 Aug 2026)": f"₹{selected_row['EntryPrice']:,.2f}" if pd.notna(selected_row["EntryPrice"]) else "N/A",
+        "Entry Price": f"₹{selected_row['EntryPrice']:,.2f}" if pd.notna(selected_row["EntryPrice"]) else "N/A",
+        "Entry Price Date": str(pd.Timestamp(selected_row["EntryPriceDate"]).date()) if pd.notna(selected_row["EntryPriceDate"]) else "N/A",
         "Cap Category": selected_row["CapCategory"],
-        "Price Date": str(pd.Timestamp(selected_row["PriceDate"]).date()) if pd.notna(selected_row["PriceDate"]) else "N/A",
-        "Units": f"{selected_row['Units']:,.4f}" if pd.notna(selected_row["Units"]) else "N/A",
+        "Current Price Date": str(pd.Timestamp(selected_row["PriceDate"]).date()) if pd.notna(selected_row["PriceDate"]) else "N/A",
+        "Units (fixed)": f"{selected_row['Units']:,.4f}" if pd.notna(selected_row["Units"]) else "N/A",
         "Daily Price Change": f"{selected_row['DailyPriceChangePct']:+.2%}",
         "Dividend Earned / Entitled": f"₹{selected_row['DividendEntitlement']:,.0f}",
+        "Accrued Coupon (modelled)": f"₹{selected_row['AccruedInterest']:,.0f}",
         "Beta": f"{selected_row['Beta']:.2f}",
         "Volatility": f"{selected_row['Volatility']:.2%}",
         "Historical CAGR": f"{selected_row['Actual_CAGR']:.2%}",
@@ -1580,19 +1931,30 @@ with detail_left:
     st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
 with detail_right:
-    if selected_row["Ticker"] != "GSEC2029" and selected_row["Ticker"] in prices_df.columns:
-        series = asof_series(prices_df[selected_row["Ticker"]], VALUATION_DATE)
-        if not series.empty:
+    if selected_row["Ticker"] != GSEC_TICKER and selected_row["Ticker"] in close_df.columns:
+        _series = close_df[selected_row["Ticker"]].dropna()
+        _series = _series[_series.index >= latest_market_date - pd.DateOffset(years=int(lookback_yrs))]
+        if not _series.empty:
             fig_selected = go.Figure()
             fig_selected.add_trace(
                 go.Scatter(
-                    x=series.index,
-                    y=series.values,
+                    x=_series.index,
+                    y=_series.values,
                     mode="lines",
                     name=selected_instrument,
                     line=dict(color=GOLD, width=2.5),
                 )
             )
+            if pd.notna(selected_row["EntryPrice"]) and pd.notna(selected_row["EntryPriceDate"]):
+                fig_selected.add_trace(
+                    go.Scatter(
+                        x=[selected_row["EntryPriceDate"]],
+                        y=[selected_row["EntryPrice"]],
+                        mode="markers",
+                        name="Entry",
+                        marker=dict(size=11, color=TEAL),
+                    )
+                )
             fig_selected.update_layout(
                 height=330,
                 title=f"{selected_instrument} — price history",
@@ -1602,7 +1964,7 @@ with detail_right:
             st.plotly_chart(fig_selected, use_container_width=True)
     else:
         st.markdown(
-            '<div class="info-box">The sovereign G-Sec is represented using its indicative price/yield assumption rather than a Yahoo Finance equity price series.</div>',
+            '<div class="info-box">The sovereign G-Sec is represented using its indicative par price / yield assumption rather than a Yahoo Finance price series.</div>',
             unsafe_allow_html=True,
         )
 
@@ -1611,8 +1973,8 @@ st.divider()
 # ============================================================
 # 13. MAIN TABS
 # ============================================================
-tab_overview, tab_holdings, tab_risk, tab_history = st.tabs(
-    ["Overview", "Holdings", "Risk & Return", "Historical Trends"]
+tab_overview, tab_holdings, tab_reco, tab_risk, tab_history = st.tabs(
+    ["Overview", "Holdings", "Recommendation", "Risk & Return", "Historical Trends"]
 )
 
 # ---------- TAB 1: OVERVIEW ----------
@@ -1621,7 +1983,7 @@ with tab_overview:
 
     with c1:
         st.markdown('<div class="section-title">Asset-Class Allocation</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-note">How the ₹1 Cr is divided across equity, debt, gold and silver</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-note">How the original ₹1 Cr was divided across equity, debt, gold and silver</div>', unsafe_allow_html=True)
 
         pie_df = pd.DataFrame([
             {"Sleeve": "Equity (11)", "Amount": df_master.loc[equity_mask, "Allocated_Amount"].sum()},
@@ -1668,7 +2030,6 @@ with tab_overview:
         )
 
         fig_growth = go.Figure()
-        # Plot the live modelled path from the current portfolio value.
         live_elapsed = np.linspace(0, max(remaining_years, 0.0), HORIZON_YEARS + 1)
         live_projection_path = (
             current_portfolio_value * (1.0 + portfolio_expected_return) ** live_elapsed
@@ -1676,8 +2037,7 @@ with tab_overview:
 
         fig_growth.add_trace(
             go.Scatter(
-                x=[min(max((TODAY - VALUATION_DATE).days / 365.25, 0), HORIZON_YEARS) + x
-                   for x in live_elapsed],
+                x=[elapsed_years_now + x for x in live_elapsed],
                 y=live_projection_path,
                 mode="lines+markers",
                 name=f"Live Projection ({portfolio_expected_return:.2%})",
@@ -1695,7 +2055,7 @@ with tab_overview:
         )
         fig_growth.add_trace(
             go.Scatter(
-                x=[min(max((TODAY - VALUATION_DATE).days / 365.25, 0), HORIZON_YEARS)],
+                x=[elapsed_years_now],
                 y=[current_portfolio_value],
                 mode="markers",
                 name="Current Portfolio Value",
@@ -1705,7 +2065,7 @@ with tab_overview:
 
         fig_growth.update_layout(
             height=340,
-            xaxis_title="Years elapsed",
+            xaxis_title="Years elapsed since 31 Aug 2026",
             yaxis_title="Portfolio value (₹)",
             yaxis_tickprefix="₹",
             legend=dict(
@@ -1716,7 +2076,7 @@ with tab_overview:
 
     st.markdown('<div class="section-title">Return Composition</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-note">Annualised weighted contribution from capital gains and income sources.</div>',
+        '<div class="section-note">Annualised weighted contribution (current market-value weights) from capital gains and income sources.</div>',
         unsafe_allow_html=True,
     )
 
@@ -1739,7 +2099,7 @@ with tab_overview:
     st.plotly_chart(fig_return, use_container_width=True)
 
     st.markdown(
-        '<div class="info-box">The investment is assumed to be initiated on 31 Aug 2026. Holdings are fixed at their entry prices; daily refreshes then re-mark those holdings to the latest market price and add declared/recorded dividend cash flows to total portfolio value.</div>',
+        '<div class="info-box">The investment is assumed to be initiated on 31 Aug 2026. Holdings (units) are fixed at their entry prices and never change; each refresh re-marks those holdings to the latest market price and adds dividends whose ex-date has passed.</div>',
         unsafe_allow_html=True,
     )
 
@@ -1749,13 +2109,14 @@ with tab_overview:
         ["Name", "MarketCapCr", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]
     ].copy()
 
-    # Show Market Cap immediately after the investment name.
     daily_move["Market Cap (₹ Cr)"] = daily_move["MarketCapCr"]
+    # Streamlit's printf-style "%.2f%%" prints the raw number, so convert the
+    # decimal change to percentage points first (0.0125 -> 1.25).
+    daily_move["DailyPriceChangePct"] = daily_move["DailyPriceChangePct"] * 100.0
     daily_move = daily_move[
         ["Name", "Market Cap (₹ Cr)", "CurrentPrice", "DailyPriceChange", "DailyPriceChangePct"]
     ]
-    daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False).copy()
-    daily_move["DailyPriceChangePct"] = daily_move["DailyPriceChangePct"] * 100.0
+    daily_move = daily_move.sort_values("DailyPriceChangePct", ascending=False)
 
     st.dataframe(
         daily_move,
@@ -1782,7 +2143,7 @@ with tab_overview:
         unsafe_allow_html=True
     )
     st.markdown(
-        '<div class="section-note">Dividend events affecting the portfolio since the 31 Aug 2026 investment date. Ex-date is the corporate-action date used for dividend entitlement. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
+        '<div class="section-note">Dividend events with an ex-date after the 31 Aug 2026 investment date, valued on the original units. Only events whose ex-date has passed are counted in portfolio value; later ones are listed as upcoming. NSE announcement/broadcast date is shown separately when the public NSE announcements page exposes a dividend-related filing; no announcement date is invented when unavailable.</div>',
         unsafe_allow_html=True,
     )
     required_display_cols = [
@@ -1791,6 +2152,12 @@ with tab_overview:
         "Dividend Entitlement", "Status", "NSE Verified", "Source"
     ]
     dividend_view = div_hist.reindex(columns=required_display_cols).copy()
+
+    if unparsed_dividends:
+        st.warning(
+            f"{unparsed_dividends} dividend event(s) have no parsable amount per share and are "
+            f"NOT included in the entitlement total."
+        )
 
     if not dividend_view.empty:
         for _date_col in ["NSE Announcement Date", "Ex-Date", "Record Date"]:
@@ -1832,38 +2199,37 @@ with tab_overview:
 with tab_holdings:
     st.markdown('<div class="section-title">All 15 Instruments</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-note">As-of 31 Aug 2026 price, units, current value, expected return and allocation.</div>',
+        '<div class="section-note">Original holdings: entry price, fixed units, current value, expected return and allocation.</div>',
         unsafe_allow_html=True,
     )
 
     display_df = df_master.copy()
+    display_df["Entry Price"] = display_df["EntryPrice"]
     display_df["Current Price"] = display_df["CurrentPrice"]
-    display_df["Price Date"] = display_df["PriceDate"]
-    display_df["Daily Change %"] = display_df["DailyPriceChangePct"] * 100.0
-    display_df["Historical CAGR"] = pd.to_numeric(display_df["Actual_CAGR"], errors="coerce") * 100.0
     display_df["Dividend Earned"] = display_df["DividendEntitlement"]
+    display_df["Accrued Interest"] = display_df["AccruedInterest"]
     display_df["Total Gain"] = display_df["TotalInvestmentGain"]
-    display_df["Dividend / Interest"] = pd.to_numeric(display_df["ExpectedIncomeYield"], errors="coerce") * 100.0
-    display_df["Capital Gain"] = pd.to_numeric(display_df["CapitalGainExpected"], errors="coerce") * 100.0
-    display_df["Expected Total Return"] = pd.to_numeric(display_df["Total_Expected_Return"], errors="coerce") * 100.0
 
-    # Streamlit's printf-style percent formatting displays the raw number.
-    # Convert decimal weights to percentage points explicitly (0.125 -> 12.5)
-    # so the table shows correct portfolio percentages.
+    # Streamlit's printf-style "%.2f%%" prints the raw number, so every decimal
+    # percentage must be converted to percentage points first (0.125 -> 12.5).
+    display_df["Daily Change %"] = display_df["DailyPriceChangePct"] * 100.0
+    display_df["Historical CAGR"] = display_df["Actual_CAGR"] * 100.0
+    display_df["Dividend / Interest"] = display_df["ExpectedIncomeYield"] * 100.0
+    display_df["Capital Gain"] = display_df["CapitalGainExpected"] * 100.0
+    display_df["Expected Total Return"] = display_df["Total_Expected_Return"] * 100.0
     display_df["Portfolio Weight %"] = display_df["Portfolio_Weight"] * 100.0
+    display_df["Current Weight %"] = display_df["CurrentWeight"] * 100.0
 
     display_df["Market Cap (₹ Cr)"] = display_df["MarketCapCr"]
 
     cols = [
-        "Name", "Market Cap (₹ Cr)", "Type", "Sector", "CapCategory", "Current Price",
-        "Units", "Portfolio Weight %", "Allocated_Amount", "CurrentValue",
-        "Dividend Earned", "Total Gain", "Daily Change %", "Historical CAGR",
-        "Capital Gain", "Dividend / Interest", "Expected Total Return", "Beta",
+        "Name", "Market Cap (₹ Cr)", "Type", "Sector", "CapCategory", "Entry Price",
+        "Current Price", "Units", "Portfolio Weight %", "Current Weight %",
+        "Allocated_Amount", "CurrentValue", "Dividend Earned", "Accrued Interest",
+        "Total Gain", "Daily Change %", "Historical CAGR", "Capital Gain",
+        "Dividend / Interest", "Expected Total Return", "Beta",
     ]
 
-    # Explicit reconciliation: raw weights must add to exactly 100% (within
-    # floating-point tolerance), and asset-class totals should match the
-    # optimizer output.
     total_weight = float(df_master["Portfolio_Weight"].sum())
     asset_weights = df_master.groupby("Type")["Portfolio_Weight"].sum().to_dict()
 
@@ -1875,7 +2241,7 @@ with tab_holdings:
     rw5.metric("Silver", f"{asset_weights.get('Silver ETF', 0.0):.2%}")
 
     if abs(total_weight - 1.0) > 1e-8:
-        st.error("Portfolio weights do not reconcile to 100%. Please refresh the model.")
+        st.error("Original portfolio weights do not reconcile to 100%. Check the snapshot file.")
 
     st.dataframe(
         display_df[cols],
@@ -1885,19 +2251,20 @@ with tab_holdings:
             "Market Cap (₹ Cr)": st.column_config.NumberColumn(
                 "Market Cap (₹ Cr)", format="₹%,.0f"
             ),
+            "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
             "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
-            "Price Date": st.column_config.DateColumn(format="DD MMM YYYY"),
             "Units": st.column_config.NumberColumn(format="%.4f"),
             "Portfolio Weight %": st.column_config.ProgressColumn(
-                "Portfolio Weight",
+                "Original Weight",
                 format="%.1f%%",
                 min_value=0,
                 max_value=max(float(display_df["Portfolio Weight %"].max()) * 1.15, 10.0),
             ),
+            "Current Weight %": st.column_config.NumberColumn(format="%.1f%%"),
             "Allocated_Amount": st.column_config.NumberColumn("Invested", format="₹%d"),
             "CurrentValue": st.column_config.NumberColumn("Current Value", format="₹%d"),
-            "UnrealizedPnL": st.column_config.NumberColumn("Price P&L", format="₹%d"),
             "Dividend Earned": st.column_config.NumberColumn(format="₹%d"),
+            "Accrued Interest": st.column_config.NumberColumn(format="₹%d"),
             "Total Gain": st.column_config.NumberColumn(format="₹%d"),
             "Daily Change %": st.column_config.NumberColumn(format="%.2f%%"),
             "Historical CAGR": st.column_config.NumberColumn(format="%.2f%%"),
@@ -1912,7 +2279,7 @@ with tab_holdings:
     h1, h2 = st.columns(2)
 
     with h1:
-        st.markdown('<div class="section-title">Weight by Instrument</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Original Weight by Instrument</div>', unsafe_allow_html=True)
         sorted_df = df_master.sort_values("Portfolio_Weight", ascending=True)
         fig_bar = px.bar(
             sorted_df,
@@ -1960,7 +2327,67 @@ with tab_holdings:
         )
         st.plotly_chart(fig_asset, use_container_width=True)
 
-# ---------- TAB 3: RISK & RETURN ----------
+# ---------- TAB 3: RECOMMENDATION (separate from the original holdings) ----------
+with tab_reco:
+    st.markdown('<div class="section-title">Current Recommendation vs Original Holdings</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-note">The optimizer re-runs on current data (lookback {lookback_yrs}Y, Rf {rf_rate:.1%}, Rm {mkt_return:.1%}) for the {selected_persona} profile. '
+        f'This is a suggestion only: it never changes your original units or the portfolio value above.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if reco_df is None:
+        st.info(f"The current recommendation could not be computed: {reco_error}")
+    else:
+        cmp_df = df_master[["Ticker", "Name", "Type", "Portfolio_Weight", "CurrentWeight"]].merge(
+            reco_df[["Ticker", "Portfolio_Weight"]].rename(columns={"Portfolio_Weight": "Recommended_Weight"}),
+            on="Ticker", how="left", validate="one_to_one",
+        )
+        cmp_df["Difference"] = cmp_df["Recommended_Weight"] - cmp_df["CurrentWeight"]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Recommended portfolio expected return", f"{optimization_meta['achieved_expected_return']:.2%}")
+        m2.metric("Original holdings expected return", f"{portfolio_expected_return:.2%}")
+        m3.metric("Target status (from inception)", "Feasible" if optimization_meta["target_feasible"] else "Not feasible")
+        st.caption(optimization_meta["solver_status"])
+
+        cmp_show = pd.DataFrame({
+            "Instrument": cmp_df["Name"],
+            "Type": cmp_df["Type"],
+            "Original weight %": cmp_df["Portfolio_Weight"] * 100.0,
+            "Current weight %": cmp_df["CurrentWeight"] * 100.0,
+            "Recommended weight %": cmp_df["Recommended_Weight"] * 100.0,
+            "Recommended − current (pp)": cmp_df["Difference"] * 100.0,
+        })
+        st.dataframe(
+            cmp_show,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Original weight %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Current weight %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Recommended weight %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Recommended − current (pp)": st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
+
+        fig_reco = go.Figure()
+        fig_reco.add_trace(go.Bar(
+            x=cmp_df["Name"], y=cmp_df["Portfolio_Weight"],
+            name="Original (locked)", marker_color=GOLD,
+        ))
+        fig_reco.add_trace(go.Bar(
+            x=cmp_df["Name"], y=cmp_df["Recommended_Weight"],
+            name="Current recommendation", marker_color=TEAL,
+        ))
+        fig_reco.update_layout(
+            barmode="group", height=420, yaxis_tickformat=".0%",
+            yaxis_title="Portfolio weight", xaxis_title="",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_reco, use_container_width=True)
+
+# ---------- TAB 4: RISK & RETURN ----------
 with tab_risk:
     eq_df = df_master[df_master["Type"] == "Equity"].copy()
 
@@ -2016,7 +2443,7 @@ with tab_risk:
         showlegend=True,
     )
     st.plotly_chart(fig_sml, use_container_width=True)
-    st.caption("Bubble size = portfolio weight. Green = historical CAGR above CAPM-implied return.")
+    st.caption("Bubble size = original portfolio weight. Green = historical CAGR above CAPM-implied return.")
 
     r1, r2 = st.columns(2)
 
@@ -2056,40 +2483,47 @@ with tab_risk:
         else:
             st.info("Not enough overlapping return history to build the correlation matrix.")
 
-# ---------- TAB 4: HISTORICAL TRENDS ----------
+# ---------- TAB 5: HISTORICAL TRENDS ----------
 with tab_history:
     st.markdown('<div class="section-title">Normalized Price Performance</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-note">Selected series indexed to 100 at the start of the available lookback window.</div>',
+        '<div class="section-note">Selected series (dividend-adjusted closes) indexed to 100 at the start of the available lookback window.</div>',
         unsafe_allow_html=True,
     )
+
+    _hist_start = latest_market_date - pd.DateOffset(years=int(lookback_yrs))
+    hist_prices = adj_df.loc[adj_df.index >= _hist_start]
 
     all_names = {
         row["Ticker"]: row["Name"]
         for _, row in df_master.iterrows()
-        if row["Ticker"] in prices_df.columns
+        if row["Ticker"] in hist_prices.columns
     }
     default_pick = [
         t
         for t in df_master[df_master["Type"] == "Equity"]["Ticker"].head(5)
-        if t in prices_df.columns
+        if t in hist_prices.columns
     ]
 
     picked = st.multiselect(
         "Instruments to plot",
         options=list(all_names.keys()) + (
-            ["^NSEI"] if "^NSEI" in prices_df.columns else []
+            ["^NSEI"] if "^NSEI" in hist_prices.columns else []
         ),
         default=default_pick + (
-            ["^NSEI"] if "^NSEI" in prices_df.columns else []
+            ["^NSEI"] if "^NSEI" in hist_prices.columns else []
         ),
         format_func=lambda t: "Nifty 50" if t == "^NSEI" else all_names.get(t, t),
     )
 
     if picked:
-        norm_df = prices_df[picked].dropna(how="all")
+        norm_df = hist_prices[picked].dropna(how="all")
         if not norm_df.empty:
-            norm_df = norm_df / norm_df.iloc[0] * 100
+            # Index each series to 100 at ITS OWN first valid price.
+            first_valid = norm_df.apply(
+                lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan
+            )
+            norm_df = norm_df / first_valid * 100
             fig_hist = go.Figure()
             for i, col in enumerate(picked):
                 label = "Nifty 50" if col == "^NSEI" else all_names.get(col, col)
@@ -2121,12 +2555,13 @@ with tab_history:
     st.markdown('<div class="section-title">Gold & Silver</div>', unsafe_allow_html=True)
     fi_tickers = [
         t for t in ["GOLDBEES.NS", "SILVERBEES.NS"]
-        if t in prices_df.columns
+        if t in close_df.columns
     ]
     if fi_tickers:
         fig_fi = go.Figure()
         for t in fi_tickers:
-            series = asof_series(prices_df[t], VALUATION_DATE)
+            series = close_df[t].dropna()
+            series = series[series.index >= _hist_start]
             if not series.empty:
                 line_color = GOLD if t == "GOLDBEES.NS" else "#7A8596"
                 fig_fi.add_trace(
@@ -2134,7 +2569,7 @@ with tab_history:
                         x=series.index,
                         y=series,
                         mode="lines",
-                        name=all_names.get(t, t),
+                        name=dict((i["Ticker"], i["Name"]) for i in INSTRUMENTS_MASTER).get(t, t),
                         line=dict(color=line_color, width=2),
                     )
                 )
@@ -2143,6 +2578,9 @@ with tab_history:
 
 st.write("")
 st.caption(
-    f"Educational/simulation dashboard. Holdings are fixed from 31 Aug 2026 entry prices; current value is marked to the latest available trading price. On the investment date itself, day-one P&L is zero by construction. "
-    f"Historical CAGR, beta and CAPM metrics are model estimates. Dividends are tracked from NSE corporate actions where available, with Yahoo Finance as a fallback; payment settlement is not fabricated when the source does not expose it."
+    "Educational/simulation dashboard. The original holdings (units) are fixed from the 31 Aug 2026 entry prices "
+    "and stored in a snapshot; current value is marked to the latest available trading price. Fractional units are "
+    "allowed (no cash residual). Historical CAGR, beta and CAPM metrics are model estimates. Dividends are tracked from "
+    "NSE corporate actions where available, with Yahoo Finance as a fallback; payment settlement is not fabricated when "
+    "the source does not expose it. The G-Sec is carried at indicative par with a modelled accrued coupon."
 )
