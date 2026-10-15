@@ -315,33 +315,34 @@ SNAPSHOT_PATH = os.path.join(APP_DIR, "inception_holdings.json")
 AUTOSAVE_PATH = os.path.join(APP_DIR, ".inception_holdings_autosave.json")
 SNAPSHOT_SCHEMA_VERSION = 1
 
-# Persona target = objective only.
-# It is displayed as the person's desired outcome and used to
-# show required CAGR / target path. It is NOT used to solve weights.
+# Persona policy bands intentionally do not overlap for TOTAL EQUITY exposure.
+# This ensures Aggressive, Moderate and Conservative recommendations express
+# materially different risk profiles even when one or more target returns are
+# infeasible. These are model guardrails, not guarantees of realised risk/return.
 PERSONAS = {
     "Aggressive": {
         "target_corpus": 2_25_00_000,
-        "min_equity": 0.65, "max_equity": 0.90,
-        "min_debt": 0.05, "max_debt": 0.20,
-        "min_gold": 0.02, "max_gold": 0.10,
-        "min_silver": 0.02, "max_silver": 0.10,
-        "risk_label": "Highest target / highest risk budget",
+        "min_equity": 0.72, "max_equity": 0.86,
+        "min_debt": 0.05, "max_debt": 0.15,
+        "min_gold": 0.03, "max_gold": 0.08,
+        "min_silver": 0.02, "max_silver": 0.06,
+        "risk_label": "Higher equity exposure / highest risk budget",
     },
     "Moderate": {
         "target_corpus": 2_00_00_000,
-        "min_equity": 0.50, "max_equity": 0.80,
-        "min_debt": 0.10, "max_debt": 0.35,
-        "min_gold": 0.05, "max_gold": 0.15,
-        "min_silver": 0.02, "max_silver": 0.10,
-        "risk_label": "Balanced target / medium risk budget",
+        "min_equity": 0.55, "max_equity": 0.69,
+        "min_debt": 0.15, "max_debt": 0.29,
+        "min_gold": 0.06, "max_gold": 0.13,
+        "min_silver": 0.03, "max_silver": 0.08,
+        "risk_label": "Balanced equity and fixed-income exposure",
     },
     "Conservative": {
         "target_corpus": 1_75_00_000,
-        "min_equity": 0.35, "max_equity": 0.65,
-        "min_debt": 0.20, "max_debt": 0.55,
-        "min_gold": 0.05, "max_gold": 0.20,
-        "min_silver": 0.02, "max_silver": 0.10,
-        "risk_label": "Lower target / lower risk budget",
+        "min_equity": 0.35, "max_equity": 0.49,
+        "min_debt": 0.35, "max_debt": 0.50,
+        "min_gold": 0.10, "max_gold": 0.20,
+        "min_silver": 0.03, "max_silver": 0.08,
+        "risk_label": "Lower equity / higher fixed-income exposure",
     },
 }
 
@@ -747,15 +748,34 @@ def build_persona_weights(df_analysis, persona_name, returns_df):
         else:
             bounds.append((cfg["min_silver"], cfg["max_silver"]))
 
+    # Begin at each asset-class minimum, then distribute the remaining weight
+    # within class caps. This creates a feasible seed for SLSQP and avoids an
+    # initial guess that accidentally breaches a persona's equity ceiling.
     w0 = np.zeros(len(out), dtype=float)
     w0[eq_idx] = cfg["min_equity"] / len(eq_idx)
     w0[bond_idx] = cfg["min_debt"] / len(bond_idx)
     w0[gold_idx] = cfg["min_gold"] / len(gold_idx)
     w0[silver_idx] = cfg["min_silver"] / len(silver_idx)
 
-    remainder = 1.0 - w0.sum()
-    if remainder > 0:
-        w0[eq_idx] += remainder / len(eq_idx)
+    upper_bounds = np.array([b[1] for b in bounds], dtype=float)
+    remainder = max(0.0, 1.0 - float(w0.sum()))
+    for idx, class_max in (
+        (eq_idx, cfg["max_equity"]),
+        (bond_idx, cfg["max_debt"]),
+        (gold_idx, cfg["max_gold"]),
+        (silver_idx, cfg["max_silver"]),
+    ):
+        class_room = max(0.0, float(class_max - w0[idx].sum()))
+        security_room = np.maximum(upper_bounds[idx] - w0[idx], 0.0)
+        room = min(class_room, float(security_room.sum()), remainder)
+        if room > 0 and security_room.sum() > 0:
+            w0[idx] += room * security_room / security_room.sum()
+            remainder -= room
+    if remainder > 1e-7:
+        raise RuntimeError(
+            f"Persona '{persona_name}' allocation guardrails cannot absorb "
+            f"the full portfolio weight; {remainder:.4%} remains unallocated."
+        )
 
     max_return_res = minimize(
         lambda w: -float(np.dot(w, expected)),
@@ -1472,12 +1492,31 @@ if stale_prices:
 persona_cfg = PERSONAS[selected_persona]
 target_cagr = persona_cfg["target_cagr"]
 
-# Current recommendation (separate from the original holdings; never used for valuation).
-reco_df, optimization_meta, reco_error = None, None, ""
-try:
-    reco_df, optimization_meta = build_persona_weights(df_cur, selected_persona, returns_df)
-except Exception as e:
-    reco_error = str(e)
+# Calculate a separate current recommendation for EACH persona on the same current
+# market/risk inputs. Only the selected recommendation drives the selected-profile
+# KPI cards; the originals remain locked and are never overwritten.
+persona_recommendations = {}
+for _persona_name in PERSONAS:
+    try:
+        _persona_df, _persona_meta = build_persona_weights(
+            df_cur, _persona_name, returns_df
+        )
+        persona_recommendations[_persona_name] = {
+            "df": _persona_df,
+            "meta": _persona_meta,
+            "error": "",
+        }
+    except Exception as _persona_exc:
+        persona_recommendations[_persona_name] = {
+            "df": None,
+            "meta": None,
+            "error": str(_persona_exc),
+        }
+
+_selected_rec = persona_recommendations[selected_persona]
+reco_df = _selected_rec["df"]
+optimization_meta = _selected_rec["meta"]
+reco_error = _selected_rec["error"]
 
 # ============================================================
 # 8. DIVIDENDS + PORTFOLIO VALUE
@@ -1857,7 +1896,7 @@ if live_target_achievable:
         f"With {remaining_years:.2f} years remaining until {target_date.strftime('%d %b %Y')}, "
         f"the portfolio needs {live_required_cagr:.2%} CAGR from today to reach the fixed "
         f"₹{persona_cfg['target_corpus']/1e7:.2f} Cr target. "
-        f"Current modelled return is {portfolio_expected_return:.2%}; the target is currently on track."
+        f"The selected-persona recommended return is {projection_expected_return:.2%}; the target is currently on track under the model assumptions."
     )
 else:
     st.warning(
@@ -1911,11 +1950,20 @@ selected_instrument = st.selectbox(
 )
 selected_row = df_master.loc[df_master["Name"].eq(selected_instrument)].iloc[0]
 
-i1, i2, i3, i4 = st.columns(4)
+_selected_recommended_weight = np.nan
+_selected_recommended_amount = np.nan
+if reco_df is not None:
+    _recommended_match = reco_df.loc[reco_df["Ticker"].eq(selected_row["Ticker"])]
+    if not _recommended_match.empty:
+        _selected_recommended_weight = float(_recommended_match.iloc[0]["Portfolio_Weight"])
+        _selected_recommended_amount = float(_recommended_match.iloc[0]["Allocated_Amount"])
+
+i1, i2, i3, i4, i5 = st.columns(5)
 i1.metric("Current Price", f"₹{selected_row['CurrentPrice']:,.2f}" if pd.notna(selected_row["CurrentPrice"]) else "N/A")
-i2.metric("Original Weight", f"{selected_row['Portfolio_Weight']:.2%}")
-i3.metric("Allocated", f"₹{selected_row['Allocated_Amount']/1e5:.2f} L")
-i4.metric("Current Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
+i2.metric("Original Weight (locked)", f"{selected_row['Portfolio_Weight']:.2%}")
+i3.metric("Recommended Weight · " + selected_persona, f"{_selected_recommended_weight:.2%}" if np.isfinite(_selected_recommended_weight) else "N/A")
+i4.metric("Recommended Allocation", f"₹{_selected_recommended_amount/1e5:.2f} L" if np.isfinite(_selected_recommended_amount) else "N/A")
+i5.metric("Original Current Value", f"₹{selected_row['TotalCurrentValue']/1e5:.2f} L" if pd.notna(selected_row["TotalCurrentValue"]) else "N/A")
 
 detail_left, detail_right = st.columns([1, 1.4])
 
@@ -1997,15 +2045,41 @@ with tab_overview:
     c1, c2 = st.columns([1, 1.3])
 
     with c1:
-        st.markdown('<div class="section-title">Asset-Class Allocation</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-note">How the original ₹1 Cr was divided across equity, debt, gold and silver</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-title">Recommended Asset-Class Allocation · {selected_persona}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="section-note">Allocation recommended for the selected investor persona from a model corpus of ₹1 Cr. '
+            'Switch Aggressive, Moderate or Conservative in the sidebar to update this chart. Original holdings and their P&L remain locked.</div>',
+            unsafe_allow_html=True,
+        )
 
-        pie_df = pd.DataFrame([
-            {"Sleeve": "Equity (11)", "Amount": df_master.loc[equity_mask, "Allocated_Amount"].sum()},
-            {"Sleeve": "Debt (2)", "Amount": df_master.loc[bond_mask, "Allocated_Amount"].sum()},
-            {"Sleeve": "Gold", "Amount": df_master.loc[gold_mask, "Allocated_Amount"].sum()},
-            {"Sleeve": "Silver", "Amount": df_master.loc[silver_mask, "Allocated_Amount"].sum()},
-        ])
+        if reco_df is not None:
+            _rec_class = reco_df.groupby("Type")["Allocated_Amount"].sum().to_dict()
+            pie_df = pd.DataFrame([
+                {"Sleeve": "Equity (11)", "Amount": _rec_class.get("Equity", 0.0)},
+                {"Sleeve": "Debt (2)", "Amount": _rec_class.get("Bond", 0.0)},
+                {"Sleeve": "Gold", "Amount": _rec_class.get("Gold ETF", 0.0)},
+                {"Sleeve": "Silver", "Amount": _rec_class.get("Silver ETF", 0.0)},
+            ])
+            _pie_center_text = f"₹{CORPUS/1e7:.2f} Cr<br>recommended"
+        else:
+            # Explicit fallback: do not imply these are optimized weights if the optimizer failed.
+            _orig_class = {
+                "Equity": df_master.loc[equity_mask, "Allocated_Amount"].sum(),
+                "Bond": df_master.loc[bond_mask, "Allocated_Amount"].sum(),
+                "Gold ETF": df_master.loc[gold_mask, "Allocated_Amount"].sum(),
+                "Silver ETF": df_master.loc[silver_mask, "Allocated_Amount"].sum(),
+            }
+            pie_df = pd.DataFrame([
+                {"Sleeve": "Equity (11)", "Amount": _orig_class["Equity"]},
+                {"Sleeve": "Debt (2)", "Amount": _orig_class["Bond"]},
+                {"Sleeve": "Gold", "Amount": _orig_class["Gold ETF"]},
+                {"Sleeve": "Silver", "Amount": _orig_class["Silver ETF"]},
+            ])
+            _pie_center_text = "Original<br>holdings"
+            st.warning(f"The {selected_persona} recommendation is unavailable: {reco_error}. The chart shows original holdings for context.")
 
         fig_pie = go.Figure(
             data=[
@@ -2027,10 +2101,10 @@ with tab_overview:
             showlegend=False,
             annotations=[
                 dict(
-                    text=f"₹{current_portfolio_value/1e7:.2f} Cr",
+                    text=_pie_center_text,
                     x=0.5,
                     y=0.5,
-                    font=dict(size=16, family="Fraunces, serif", color=TEXT),
+                    font=dict(size=15, family="Fraunces, serif", color=TEXT),
                     showarrow=False,
                 )
             ],
@@ -2139,7 +2213,7 @@ with tab_overview:
         hide_index=True,
         column_config={
             "Market Cap (₹ Cr)": st.column_config.NumberColumn(
-                "Market Cap (₹ Cr)", format="₹%,.0f"
+                "Market Cap (₹ Cr)", format="₹%.0f"
             ),
             "CurrentPrice": st.column_config.NumberColumn(
                 "Current Price", format="₹%.2f"
@@ -2264,7 +2338,7 @@ with tab_holdings:
         hide_index=True,
         column_config={
             "Market Cap (₹ Cr)": st.column_config.NumberColumn(
-                "Market Cap (₹ Cr)", format="₹%,.0f"
+                "Market Cap (₹ Cr)", format="₹%.0f"
             ),
             "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
             "Current Price": st.column_config.NumberColumn(format="₹%.2f"),
@@ -2344,7 +2418,82 @@ with tab_holdings:
 
 # ---------- TAB 3: RECOMMENDATION (separate from the original holdings) ----------
 with tab_reco:
-    st.markdown('<div class="section-title">Current Recommendation vs Original Holdings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Persona Allocation Comparison</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-note">Each persona is optimized independently using the same latest market data. '
+        'Equity exposure bands are deliberately non-overlapping: Aggressive 72–86%, Moderate 55–69%, '
+        'and Conservative 35–49%. This guarantees different asset-class mixes; the optimizer separately '
+        'calculates each security weight. These recommendations do not change the locked original holdings.</div>',
+        unsafe_allow_html=True,
+    )
+
+    _class_rows = []
+    _security_rows = []
+    _persona_class_names = ["Equity", "Bond", "Gold ETF", "Silver ETF"]
+    for _pname in PERSONAS:
+        _prec = persona_recommendations[_pname]
+        if _prec["df"] is None:
+            _class_rows.append({"Persona": _pname, "Status": "Unavailable"})
+            continue
+        _pdf = _prec["df"]
+        _pmeta = _prec["meta"]
+        _weights_by_class = _pdf.groupby("Type")["Portfolio_Weight"].sum().to_dict()
+        _class_rows.append({
+            "Persona": _pname,
+            "Equity %": 100 * _weights_by_class.get("Equity", 0.0),
+            "Fixed income %": 100 * _weights_by_class.get("Bond", 0.0),
+            "Gold ETF %": 100 * _weights_by_class.get("Gold ETF", 0.0),
+            "Silver ETF %": 100 * _weights_by_class.get("Silver ETF", 0.0),
+            "Expected annual return %": 100 * _pmeta["achieved_expected_return"],
+            "Target corpus (₹ Cr)": _pmeta["target_corpus"] / 1e7,
+            "Target feasible": "Yes" if _pmeta["target_feasible"] else "No",
+        })
+
+    _class_compare = pd.DataFrame(_class_rows)
+    if not _class_compare.empty:
+        st.dataframe(
+            _class_compare,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Equity %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Fixed income %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Gold ETF %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Silver ETF %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Expected annual return %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Target corpus (₹ Cr)": st.column_config.NumberColumn(format="₹%.2f Cr"),
+            },
+        )
+
+    _security_compare = pd.DataFrame({
+        "Instrument": df_cur["Name"],
+        "Asset class": df_cur["Type"],
+    })
+    for _pname in PERSONAS:
+        _prec = persona_recommendations[_pname]
+        if _prec["df"] is not None:
+            _pweights = _prec["df"].set_index("Ticker")["Portfolio_Weight"]
+            _security_compare[f"{_pname} weight %"] = df_cur["Ticker"].map(_pweights).to_numpy() * 100.0
+            _security_compare[f"{_pname} allocation (₹)"] = df_cur["Ticker"].map(_pweights).to_numpy() * CORPUS
+        else:
+            _security_compare[f"{_pname} weight %"] = np.nan
+            _security_compare[f"{_pname} allocation (₹)"] = np.nan
+    st.markdown('<div class="section-title">Security-Level Allocations by Persona</div>', unsafe_allow_html=True)
+    st.dataframe(
+        _security_compare,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Aggressive weight %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Moderate weight %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Conservative weight %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Aggressive allocation (₹)": st.column_config.NumberColumn(format="₹%.0f"),
+            "Moderate allocation (₹)": st.column_config.NumberColumn(format="₹%.0f"),
+            "Conservative allocation (₹)": st.column_config.NumberColumn(format="₹%.0f"),
+        },
+    )
+
+    st.markdown('<div class="section-title">Selected Persona vs Original Holdings</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="section-note">The optimizer re-runs on current data (lookback {lookback_yrs}Y, Rf {rf_rate:.1%}, Rm {mkt_return:.1%}) for the {selected_persona} profile. '
         f'This is a suggestion only: it never changes your original units or the portfolio value above.</div>',
